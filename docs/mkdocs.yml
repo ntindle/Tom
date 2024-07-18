@@ -1,5 +1,5 @@
 site_name: AutoGPT Documentation
-site_url: https://docs.agpt.co/
+site_url: https://https://test-auto-gpt-docs.netlify.app/
 repo_url: https://github.com/Significant-Gravitas/AutoGPT
 docs_dir: content
 nav:
@@ -132,7 +132,12 @@ markdown_extensions:
 
 plugins:
   - table-reader
+
   - search
+
+extra:
+  version:
+    provider: mike
 
 extra_javascript:
   - https://unpkg.com/tablesort@5.3.0/dist/tablesort.min.js
