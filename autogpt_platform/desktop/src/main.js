@@ -7,6 +7,7 @@ const { app, BrowserWindow, Menu, Tray, dialog, ipcMain, nativeImage, shell } = 
 const { defaultDataDir, readRuntimeManifest, runtimeDir } = require("./paths");
 const { Runtime } = require("./runtime");
 
+const ICON = path.join(__dirname, "icon.png");
 const dataDir = defaultDataDir();
 const logsDir = path.join(dataDir, "logs");
 
@@ -87,6 +88,7 @@ function showStartupWindow() {
     height: 360,
     resizable: false,
     title: "AutoGPT",
+    icon: ICON,
     show: false,
     webPreferences: {
       preload: path.join(__dirname, "startup-preload.js"),
@@ -113,6 +115,7 @@ function openMainWindow() {
     minWidth: 900,
     minHeight: 600,
     title: "AutoGPT",
+    icon: ICON,
     show: false,
     webPreferences: { contextIsolation: true, sandbox: true },
   });
@@ -153,8 +156,7 @@ function focusWindow() {
 }
 
 function createTray() {
-  const icon = nativeImage.createFromPath(path.join(__dirname, "icon.png"));
-  tray = new Tray(icon.isEmpty() ? nativeImage.createEmpty() : icon.resize({ width: 16 }));
+  tray = new Tray(nativeImage.createFromPath(ICON).resize({ width: 16, height: 16 }));
   tray.setToolTip("AutoGPT");
   tray.setContextMenu(
     Menu.buildFromTemplate([

@@ -86,68 +86,79 @@ class Stack:
         data.prepare()
         self.registry.reap_leftovers()
         secret = settings.ensure_secrets(bundle, data)
-        user = settings.read_user_settings(data)
         port = ports.allocate(data.ports_file)
-        env = settings.backend_environment(bundle, data, port, secret, user)
-        self.env = env
-
+        self.env = settings.backend_environment(
+            bundle, data, port, secret, settings.read_user_settings(data)
+        )
         first_boot = not postgres.is_initialized(data)
+        self.start_infrastructure(port, secret, first_boot)
+        self.migrate(port, secret, first_boot)
+        self.start_apps(port, secret)
+        return self.env["AUTOGPT_PUBLIC_URL"]
+
+    def start_infrastructure(
+        self, port: dict[str, int], secret: dict[str, str], first_boot: bool
+    ) -> None:
+        """PostgreSQL, Valkey and RabbitMQ do not depend on each other, so
+        they boot side by side; RabbitMQ is the slowest and sets the pace."""
+        bundle, data = self.bundle, self.data
         events.progress(
-            "database",
+            "infrastructure",
             "Setting up the database (first start only)"
             if first_boot
-            else "Starting the database",
+            else "Starting the database and message queue",
         )
+        rabbit_user = secret["RABBITMQ_DEFAULT_USER"]
+        rabbit_password = secret["RABBITMQ_DEFAULT_PASS"]
         postgres.initialize(bundle, data, secret["POSTGRES_PASSWORD"])
-        database = postgres.process(bundle, data, port["postgres"])
-        self.launch(database)
-        self.require(
-            postgres.wait_ready(port["postgres"], secret["POSTGRES_PASSWORD"]), database
-        )
-
-        events.progress("cache", "Starting the cache")
         valkey.write_config(
             data, port["valkey"], port["valkey_bus"], secret["REDIS_PASSWORD"]
         )
+        rabbitmq.prepare(data, port["rabbitmq"], rabbit_user, rabbit_password)
+
+        database = postgres.process(bundle, data, port["postgres"])
         cache = valkey.process(bundle, data, port["valkey"], secret["REDIS_PASSWORD"])
-        self.launch(cache)
+        queue = rabbitmq.process(bundle, data, port)
+        for process in (database, cache, queue):
+            self.launch(process)
+
+        self.require(
+            postgres.wait_ready(port["postgres"], secret["POSTGRES_PASSWORD"]), database
+        )
         self.require(valkey.wait_ready(port["valkey"], secret["REDIS_PASSWORD"]), cache)
         valkey.ensure_cluster(port["valkey"], secret["REDIS_PASSWORD"])
-
-        events.progress("queue", "Starting the message queue")
-        rabbit_user = secret["RABBITMQ_DEFAULT_USER"]
-        rabbit_password = secret["RABBITMQ_DEFAULT_PASS"]
-        rabbitmq.prepare(data, port["rabbitmq"], rabbit_user, rabbit_password)
-        queue = rabbitmq.process(bundle, data, port)
-        self.launch(queue)
         self.require(
             rabbitmq.wait_ready(port["rabbitmq"], rabbit_user, rabbit_password), queue
         )
 
+    def migrate(
+        self, port: dict[str, int], secret: dict[str, str], first_boot: bool
+    ) -> None:
         events.progress(
             "migrate",
-            "Creating the database tables (this can take a few minutes)"
+            "Creating the database tables (first start only)"
             if first_boot
             else "Checking for database updates",
         )
         connect = self.database_connector(port["postgres"], secret["POSTGRES_PASSWORD"])
-        bootstrap.create_schemas(bundle, connect)
+        bootstrap.create_schemas(self.bundle, connect)
         bootstrap.refuse_interrupted_migration(connect)
-        bootstrap.apply_migrations(bundle, env)
+        bootstrap.apply_migrations(self.bundle, self.env)
         bootstrap.configure_frontend_role(
-            bundle, connect, secret["AUTOGPT_FRONTEND_DB_PASSWORD"]
+            self.bundle, connect, secret["AUTOGPT_FRONTEND_DB_PASSWORD"]
         )
 
+    def start_apps(self, port: dict[str, int], secret: dict[str, str]) -> None:
+        bundle, data = self.bundle, self.data
         events.progress("services", "Starting AutoGPT")
-        for service in apps.backend_processes(bundle, data, env):
+        for service in apps.backend_processes(bundle, data, self.env):
             self.launch(service)
-        frontend_env = settings.frontend_environment(env, port, secret, data)
+        frontend_env = settings.frontend_environment(self.env, port, secret, data)
         self.launch(apps.frontend_process(bundle, data, frontend_env))
 
-        public_url = env["AUTOGPT_PUBLIC_URL"]
         self.proxy = ProxyThread(
             Upstreams(
-                public_url=public_url,
+                public_url=self.env["AUTOGPT_PUBLIC_URL"],
                 rest=f"http://127.0.0.1:{port['agent_api']}",
                 websocket=f"http://127.0.0.1:{port['websocket']}",
                 frontend=f"http://127.0.0.1:{port['frontend']}",
@@ -155,10 +166,8 @@ class Stack:
             port["public"],
         )
         self.proxy.start()
-
         self.wait_for_apps(port)
         self.registry.record(self.processes)
-        return public_url
 
     def launch(self, process: ManagedProcess) -> None:
         process.start()

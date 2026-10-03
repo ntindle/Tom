@@ -59,6 +59,9 @@ class Build:
         self.cache = cache
         self.artifacts = ARTIFACTS[platform_key()]
         self.python = out / "python" / ("python.exe" if WINDOWS else "bin/python3")
+        self.site_packages = out / "python" / (
+            "Lib/site-packages" if WINDOWS else "lib/python3.13/site-packages"
+        )
         self.node = out / "node" / f"node{EXE}"
 
     def fetch(self, name: str) -> Path:
@@ -68,6 +71,7 @@ class Build:
 
     def step_python(self) -> None:
         extract(self.fetch("python"), self.out / "python", strip_top_level=True)
+        shutil.rmtree(self.out / "site", ignore_errors=True)  # see step_relocate
         # uv treats a standalone build as externally managed; this tree is
         # ours to install into.
         for marker in (self.out / "python").rglob("EXTERNALLY-MANAGED"):
@@ -222,6 +226,8 @@ class Build:
         shutil.copytree(frontend / ".next" / "static", target / ".next" / "static")
         shutil.copytree(frontend / "public", target / "public")
         shutil.rmtree(target / ".next" / "cache", ignore_errors=True)
+        # webpack's build cache is several GB and only speeds up a rebuild.
+        shutil.rmtree(frontend / ".next" / "cache", ignore_errors=True)
 
     # --- glue -------------------------------------------------------------
 
@@ -254,6 +260,116 @@ class Build:
         (self.out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
 
 
+    # --- size and startup ------------------------------------------------
+
+    def step_prune(self) -> None:
+        """Drop what the runtime never loads. Erlang/OTP ships every
+        application it has (a GUI toolkit, SNMP, CORBA-era protocols);
+        RabbitMQ needs the handful in ERLANG_APPS."""
+        for application in (self.out / "erlang" / "lib").iterdir():
+            name = application.name.rsplit("-", 1)[0]
+            if name not in ERLANG_APPS:
+                shutil.rmtree(application)
+                continue
+            for unused in ("doc", "examples", "src", "c_src", "emacs"):
+                shutil.rmtree(application / unused, ignore_errors=True)
+        # The engines the runtime uses were copied to prisma/ by step_prisma;
+        # the copies npm left inside node_modules are dead weight.
+        for engine in (self.out / "prisma" / "node_modules").rglob("*-engine-*"):
+            if engine.is_file() and engine.stat().st_size > 1_000_000:
+                engine.unlink()
+        for cache in (self.out / "python").rglob("__pycache__"):
+            shutil.rmtree(cache, ignore_errors=True)
+        shutil.rmtree(self.out / "python" / "include", ignore_errors=True)
+        over_budget = [
+            str(path.relative_to(self.out))
+            for path in self.out.rglob("*")
+            if path.is_file()
+            and len(str(path.relative_to(self.out))) - RELOCATION_SAVING > MAX_RELATIVE_PATH
+        ]
+        if over_budget:
+            raise RuntimeError(f"paths too long for a Windows install: {over_budget[:5]}")
+
+    def step_relocate(self) -> None:
+        """Move third-party packages from python/Lib/site-packages to site/.
+
+        Windows limits a path to 260 characters and the bundle installs under
+        the user's profile. Some SDKs generate module names over 150
+        characters long; 20 characters saved on every path keeps the longest
+        one inside the limit for any Windows user name. A .pth file makes the
+        interpreter treat site/ exactly like site-packages (it runs the moved
+        packages' own .pth files too, which pywin32 depends on)."""
+        target = self.out / "site"
+        if target.exists():
+            shutil.rmtree(target)
+        shutil.move(self.site_packages, target)
+        self.site_packages.mkdir()
+        (self.site_packages / "autogpt-desktop.pth").write_text(
+            "import os, site, sys; "
+            'site.addsitedir(os.path.join(sys.prefix, os.pardir, "site"))\n',
+            encoding="utf-8",
+        )
+
+    def step_compile(self) -> None:
+        """Ship bytecode. uv installs none, and the installed bundle is
+        read-only, so without this every service would recompile every module
+        on every start (measured: 51s to ready without, 34s with).
+        `unchecked-hash` trusts the .pyc without stat-ing its source, which
+        suits files an installer may give fresh timestamps."""
+        library = self.python.parent / "Lib" if WINDOWS else self.out / "python" / "lib"
+        run(
+            [
+                str(self.python),
+                "-m",
+                "compileall",
+                "-q",
+                "-j",
+                "0",
+                "--invalidation-mode",
+                "unchecked-hash",
+                str(library),
+                str(self.out / "site"),
+                str(self.out / "backend" / "backend"),
+                str(self.out / "autogpt_desktop"),
+            ],
+            check=False,  # a few vendored test fixtures are intentionally invalid
+        )
+        # __pycache__/name.cpython-313.pyc is 24 characters longer than its
+        # source. Where that would break the path budget, ship the source
+        # alone; those few modules compile in memory when imported.
+        for compiled in self.out.rglob("*.pyc"):
+            if len(str(compiled.relative_to(self.out))) > MAX_RELATIVE_PATH:
+                compiled.unlink()
+
+
+# The install prefix on Windows is at most 80 characters
+# (C:\Users\<20-character name>\AppData\Local\Programs\AutoGPT\resources\runtime\),
+# which leaves this much of the 260-character limit for paths inside the bundle.
+MAX_RELATIVE_PATH = 170
+# What step_relocate takes off a site-packages path (prune runs before it).
+RELOCATION_SAVING = len("python/Lib/site-packages") - len("site")
+
+# OTP applications RabbitMQ 4.1 and its Elixir-based CLI load.
+ERLANG_APPS = {
+    "asn1",
+    "compiler",
+    "crypto",
+    "eldap",
+    "erts",
+    "inets",
+    "kernel",
+    "mnesia",
+    "os_mon",
+    "public_key",
+    "runtime_tools",
+    "sasl",
+    "ssl",
+    "stdlib",
+    "syntax_tools",
+    "tools",
+    "xmerl",
+}
+
 STEPS = (
     "python",
     "node",
@@ -266,12 +382,21 @@ STEPS = (
     "rabbitmq",
     "frontend",
     "assets",
+    "prune",
+    "relocate",
+    "compile",
 )
 
 
-def run(command: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None) -> None:
+def run(
+    command: list[str],
+    *,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+    check: bool = True,
+) -> None:
     print(f"  $ {' '.join(command)}", flush=True)
-    subprocess.run(command, cwd=cwd, env=env, check=True)
+    subprocess.run(command, cwd=cwd, env=env, check=check)
 
 
 def _single(paths) -> Path:

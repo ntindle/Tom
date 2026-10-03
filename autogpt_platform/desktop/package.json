@@ -21,7 +21,8 @@
     "appId": "co.agpt.autogpt.desktop",
     "productName": "AutoGPT",
     "directories": {
-      "output": "dist"
+      "output": "dist",
+      "buildResources": "resources"
     },
     "files": [
       "src/**/*",
@@ -39,26 +40,39 @@
     "asar": true,
     "win": {
       "target": [
-        "nsis"
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
       ]
     },
     "nsis": {
       "oneClick": true,
       "perMachine": false,
-      "deleteAppDataOnUninstall": false
+      "deleteAppDataOnUninstall": false,
+      "artifactName": "AutoGPT-Setup-${version}-${arch}.${ext}"
     },
     "mac": {
       "target": [
-        "dmg"
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64"
+          ]
+        }
       ],
-      "category": "public.app-category.productivity"
+      "category": "public.app-category.productivity",
+      "artifactName": "AutoGPT-${version}-${arch}.${ext}"
     },
     "linux": {
       "target": [
         "AppImage",
         "deb"
       ],
-      "category": "Utility"
+      "category": "Utility",
+      "artifactName": "AutoGPT-${version}-${arch}.${ext}"
     }
   }
 }
