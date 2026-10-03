@@ -2,6 +2,7 @@
 
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
 const { test } = require("node:test");
 
@@ -118,12 +119,62 @@ test("a Developer ID build looks at the packed app before making an installer fr
   const hook = configured({ AUTOGPT_DESKTOP_MAC_SIGN: "developer-id" }).artifactBuildStarted;
   assert.equal(typeof hook, "function");
   // No codesign here (or no app there): either way the build is refused, and
-  // the disk image and the zip get the same answer from one look.
-  const dmg = hook({ file: path.join(DESKTOP, "dist", "AutoGPT-1.4.0-arm64.dmg") });
-  const zip = hook({ file: path.join(DESKTOP, "dist", "AutoGPT-1.4.0-arm64.zip") });
+  // the disk image and the zip get the same answer from one look. An output
+  // directory of its own: dist/ may hold an app someone built.
+  const output = fs.mkdtempSync(path.join(os.tmpdir(), "no-app-"));
+  t.after(() => fs.rmSync(output, { recursive: true, force: true }));
+  const dmg = hook({ file: path.join(output, "AutoGPT-1.4.0-arm64.dmg") });
+  const zip = hook({ file: path.join(output, "AutoGPT-1.4.0-arm64.zip") });
   assert.equal(dmg, zip);
   await assert.rejects(dmg, /A Developer ID build was asked for, but AutoGPT\.app is not signed/);
 });
+
+// What @electron/osx-sign does to every file of the app, in a process that
+// may have fewer files open than the directory holds.
+const OPEN_EVERY_FILE = `
+  const [, configFile, dir] = process.argv;
+  if (configFile) require(configFile);
+  const { isBinaryFile } = require("isbinaryfile");
+  const fs = require("node:fs"), path = require("node:path");
+  const files = fs.readdirSync(dir).map((name) => path.join(dir, name));
+  // Written straight to the descriptor: with none to spare, process.stdout
+  // cannot even be set up.
+  Promise.all(files.map((file) => isBinaryFile(file))).then(
+    () => fs.writeSync(1, "opened them all"),
+    (error) => { fs.writeSync(1, String(error.code)); process.exit(0); },
+  );
+`;
+
+function openEveryFile(dir, configFile) {
+  const { execFileSync } = require("node:child_process");
+  const command = 'ulimit -n 256 && exec "$0" -e "$1" "$2" "$3"';
+  return execFileSync("sh", ["-c", command, process.execPath, OPEN_EVERY_FILE, configFile, dir], {
+    cwd: DESKTOP,
+    encoding: "utf8",
+  }).trim();
+}
+
+test(
+  "signing a bundle of more files than may be open at once waits instead of failing",
+  { skip: process.platform === "win32" && "Windows has no such limit, and nothing is signed this way there" },
+  (t) => {
+    try {
+      require.resolve("isbinaryfile");
+    } catch {
+      return t.skip("npm install has not been run");
+    }
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "open-files-"));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    for (let index = 0; index < 1000; index += 1) fs.writeFileSync(path.join(dir, `f${index}`), "text");
+    assert.equal(
+      openEveryFile(dir, ""),
+      "EMFILE",
+      "the library that signs no longer fails on its own when it opens more files than are allowed: " +
+        "the graceful-fs line at the top of electron-builder.config.js, and this test, can go",
+    );
+    assert.equal(openEveryFile(dir, path.join(DESKTOP, "electron-builder.config.js")), "opened them all");
+  },
+);
 
 test("any other value for the macOS setting is the unsigned build", () => {
   for (const value of ["true", "1", "Developer-ID", ""]) {

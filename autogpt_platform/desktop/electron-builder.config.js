@@ -33,6 +33,15 @@
 
 const path = require("node:path");
 
+// To sign a macOS app, @electron/osx-sign opens every file in it at once to
+// see which are programs, and the bundle has tens of thousands. Past the
+// system's limit on open files that is an error, not a wait: it failed on
+// GitHub's macOS machines, and passed on a Mac whose limit happened to be
+// higher than the number of files. With this, an open in this process waits
+// for a free slot instead. It must run before that library is loaded, which
+// electron-builder does only when it signs.
+require("graceful-fs").gracefulify(require("node:fs"));
+
 const { artifactNames, identity, releaseTag } = require("./src/identity");
 const { releaseFeed } = require("./src/updater");
 const {
