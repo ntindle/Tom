@@ -20,6 +20,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import erlang_patches
 import frontend_role_sql
 import lock_export
 from artifacts import ARTIFACTS, platform_key
@@ -209,6 +210,10 @@ class Build:
 
     def step_rabbitmq(self) -> None:
         extract(self.fetch("rabbitmq"), self.out / "rabbitmq", strip_top_level=True)
+
+    def step_erlang_patches(self) -> None:
+        erlc = self.out / "erlang" / "bin" / f"erlc{EXE}"
+        erlang_patches.build(erlc, self.cache, self.out / "erlang-patches")
 
     # --- frontend ---------------------------------------------------------
 
@@ -423,6 +428,7 @@ STEPS = (
     "valkey",
     "erlang",
     "rabbitmq",
+    "erlang_patches",
     "frontend",
     "assets",
     "prune",

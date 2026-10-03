@@ -12,6 +12,7 @@ each Linux path replaced by a directory under the runtime root:
       postgres/             PostgreSQL + pgvector
       valkey/               Valkey server
       erlang/, rabbitmq/    RabbitMQ and the Erlang runtime it needs
+      erlang-patches/       inet_udp built to bind loopback (build/erlang_patches.py)
       prisma/               Prisma CLI and engines
       assets/               00-init.sql
 """
@@ -64,6 +65,10 @@ class Bundle:
     @property
     def rabbitmq_home(self) -> Path:
         return self.root / "rabbitmq"
+
+    @property
+    def erlang_patches(self) -> Path:
+        return self.root / "erlang-patches"
 
     def rabbitmq_script(self, name: str) -> Path:
         return self.rabbitmq_home / "sbin" / f"{name}{SCRIPT}"

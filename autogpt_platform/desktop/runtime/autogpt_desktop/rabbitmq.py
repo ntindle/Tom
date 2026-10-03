@@ -90,9 +90,9 @@ def environment(bundle: Bundle, data: DataDir, ports: dict[str, int]) -> dict[st
         # otherwise, and it starts listening before rabbitmq.conf is read.
         # ERL_AFLAGS reaches every VM started under this environment: the
         # server, rabbitmqctl, and the short-lived `epmd-starter` node that
-        # rabbitmq-server.bat launches. A non-loopback listener from any of
+        # rabbitmq-server.bat launches. A non-loopback socket from any of
         # them is needless exposure, and on Windows raises a firewall prompt.
-        "ERL_AFLAGS": LOOPBACK_DISTRIBUTION,
+        "ERL_AFLAGS": _erlang_flags(bundle),
         "RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS": QUIET_SYSLOG,
         "ERL_CRASH_DUMP": str(Path(base) / "erl_crash.dump"),
         # Erlang finds its cookie in the home directory; point every flavour
@@ -105,6 +105,16 @@ def environment(bundle: Bundle, data: DataDir, ports: dict[str, int]) -> dict[st
         env["HOMEDRIVE"] = drive
         env["HOMEPATH"] = rest or "\\"
     return env
+
+
+def _erlang_flags(bundle: Bundle) -> str:
+    flags = LOOPBACK_DISTRIBUTION
+    if any(bundle.erlang_patches.glob("*.beam")):
+        # Shadows OTP's inet_udp and inet_tcp so that sockets opened without
+        # an address bind loopback (build/erlang_patches.py). Forward
+        # slashes: the value is split on spaces and backslashes are escapes.
+        flags += f" -pa {_short(bundle.erlang_patches).replace(os.sep, '/')}"
+    return flags
 
 
 def process(bundle: Bundle, data: DataDir, ports: dict[str, int]) -> ManagedProcess:
