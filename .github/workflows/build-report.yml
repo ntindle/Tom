@@ -8,7 +8,9 @@ name: Report desktop build results
 #
 # Two kinds of build count:
 #   - `Desktop build` (desktop-build.yml on main) started by workflow_dispatch:
-#     by the sync after a push, or by hand;
+#     by the sync after a push, or by hand. Not when it built a variant: an
+#     experiment that does not build says nothing about `desktop`. Such a
+#     run is told by its title, which desktop-build.yml's `run-name` writes;
 #   - `AutoGPT Platform - Desktop build` (the caller on `desktop`) for a push
 #     to `desktop`.
 # Pull-request builds and the nightly installed-app tests are not reported.
@@ -37,7 +39,8 @@ jobs:
       contains(fromJSON('["success", "failure", "timed_out"]'), github.event.workflow_run.conclusion) &&
       (
         (github.event.workflow_run.event == 'workflow_dispatch' &&
-         github.event.workflow_run.path == '.github/workflows/desktop-build.yml') ||
+         github.event.workflow_run.path == '.github/workflows/desktop-build.yml' &&
+         !contains(github.event.workflow_run.display_title, 'variant')) ||
         (github.event.workflow_run.event == 'push' &&
          github.event.workflow_run.head_branch == 'desktop' &&
          github.event.workflow_run.path == '.github/workflows/platform-desktop-build.yml')

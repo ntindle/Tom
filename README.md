@@ -13,6 +13,7 @@ not an official distribution.
 | --- | --- |
 | `desktop` | Upstream `dev` with the desktop distribution on top, in `autogpt_platform/desktop/`. This is where the code is. |
 | `main` | This page and the automation that keeps `desktop` in step with upstream. Deliberately not a copy of upstream, so that none of upstream's scheduled workflows or dependency bots run here. |
+| `variant/<slug>` | An experiment on top of `desktop` that may change the platform itself. It is built into an app of its own, *AutoGPT (slug)*, which installs next to the normal one and shares no data, address or updates with it. See [Variants](docs/MAINTAINING.md#variants). |
 
 Start with [`autogpt_platform/desktop/README.md`](https://github.com/ntindle/autogpt/blob/desktop/autogpt_platform/desktop/README.md)
 on the `desktop` branch.

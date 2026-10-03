@@ -438,7 +438,7 @@ def test_each_leg_is_packaged_by_exactly_one_job() -> None:
     sign = job(BUILD, "sign")
     assert "name: runtime-${{ matrix.key }}" in named_step(sign, "Download the runtime")
     assert "name: installers-${{ matrix.key }}" in named_step(sign, "Upload installers")
-    assert "needs: [build, sign]" in job(BUILD, "e2e")
+    assert "needs: [identity, build, sign]" in job(BUILD, "e2e")
 
 
 VERSIONS = ("0.0.0", "1.2.3", "10.20.30", "1.2.3-rc.1", "1.2.3-rc.10", "1.2.3-0a.x-y")

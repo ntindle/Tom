@@ -18,6 +18,7 @@ All commands use `ntindle/autogpt`; change the name if the repository moves.
 | --- | --- | --- |
 | `main` (default) | Only fork-owned files: this manual, the README, `.github/` and `scripts/`. It is an orphan branch with no upstream history. | People, through pull requests; Dependabot for action pins. |
 | `desktop` | Upstream `Significant-Gravitas/AutoGPT` `dev`, plus the desktop distribution in `autogpt_platform/desktop/` and one caller workflow, `.github/workflows/platform-desktop-build.yml`. | The daily sync, and people working on the desktop app. |
+| `variant/<slug>` (any number) | `desktop`, plus an experiment that may change anything. Built into an app that installs next to the normal one. See [Variants](#variants). | Whoever runs the experiment. Nothing automatic. |
 
 Why two branches:
 
@@ -61,8 +62,8 @@ file. See [What a sync push can start](#what-a-sync-push-can-start).
 | Workflow (on `main`) | Trigger | What it does |
 | --- | --- | --- |
 | `sync-upstream.yml` | Daily at 05:23 UTC, or by hand | Merges upstream `dev` into `desktop` if the merge is clean and the tests pass; otherwise reports in the `upstream-sync` issue. |
-| `desktop-build.yml` | Never by itself. It is started (1) by the sync after a push, (2) by hand, (3) by `desktop-nightly.yml`, (4) by the caller workflow on `desktop` for pull requests into `desktop` and for pushes to `desktop` that change the desktop app's files, and (5) by `desktop-release.yml`. | Builds and tests the installers from the commit it is given. Only (5) signs or names a version; every other build is `0.0.0-dev.<run number>`, which never looks for updates. |
-| `desktop-release.yml` | By hand only | Builds a commit of `desktop` with a version, signs it with whatever certificates the `desktop-release` environment holds, runs the installed-app tests, and publishes a GitHub Release. See [Cutting a release](#cutting-a-release). |
+| `desktop-build.yml` | Never by itself. It is started (1) by the sync after a push, (2) by hand, (3) by `desktop-nightly.yml`, (4) by the caller workflow on `desktop` (and on every `variant/<slug>` branch, which carries the same file) for pull requests into the branch and for pushes to it that change the desktop app's files, and (5) by `desktop-release.yml`. | Builds and tests the installers from the commit it is given: the normal app, or the variant its branch or its `variant` input names. Only (5) signs or names a version; every other build is `0.0.0-dev.<run number>`, which never looks for updates. |
+| `desktop-release.yml` | By hand only | Builds a commit of `desktop` (of `variant/<slug>` for a variant) with a version, signs it with whatever certificates the `desktop-release` environment holds, runs the installed-app tests, and publishes a GitHub Release. See [Cutting a release](#cutting-a-release). |
 | `desktop-nightly.yml` | Daily at 04:23 UTC | Calls `desktop-build.yml` for `desktop` with the installed-app tests switched on: the installers are installed, run, upgraded and removed on fresh Windows, macOS and Linux machines. This is the most expensive job in the repository. |
 | `build-report.yml` | When a build of `desktop` finishes | Puts a failed build into the `upstream-sync` issue and closes it again after a green one. |
 | `main-checks.yml` | Pull requests and pushes to `main` | Tests `scripts/` and lints the workflows. |
@@ -375,7 +376,9 @@ commit is green. The first green build closes the issue.
 Which builds are reported: a `desktop-build.yml` run that was dispatched (by
 the sync or by hand, whatever `ref` it was given), and a build that a push to
 `desktop` started through the caller. Builds for pull requests are not
-reported. The nightly installed-app tests are not reported either; look at
+reported, and neither is any build of a [variant](#variants): the reporter
+leaves out a dispatched run whose title contains `variant` (the title is
+`Desktop build of <ref>`, plus ` as variant <slug>` when one was named). The nightly installed-app tests are not reported either; look at
 them with:
 
 ```bash
@@ -700,6 +703,7 @@ refuse the update and have to be reinstalled by hand. Keep the subject.
    gh workflow run desktop-release.yml --repo ntindle/autogpt --ref main \
      -f version=1.2.3 -f ref=desktop
    # a pre-release:  -f version=1.3.0-rc.1 -f prerelease=true
+   # a variant:      see "Variants", "Releasing one"
    sleep 10
    gh run watch --repo ntindle/autogpt "$(gh run list --repo ntindle/autogpt --workflow desktop-release.yml --limit 1 --json databaseId -q '.[0].databaseId')"
    ```
@@ -780,6 +784,206 @@ for people who already have it. There are two separate things to do.
    check `git diff <old commit> <bad commit> -- autogpt_platform/backend/migrations`.
    If the bad version added migrations, do not go back; fix forward.
 
+## Variants
+
+A variant is an experiment that changes the platform itself, built into an
+app that installs **next to** the normal one. It is a branch plus a name:
+
+- the branch is `variant/<slug>`, made from `desktop`;
+- the name is the slug: 1 to 24 lower-case letters, digits or hyphens, not
+  starting or ending with a hyphen (`voice`, `local-models`), and not
+  `updater` or anything ending in `-updater` (the folder of another
+  install's update downloads has that name).
+
+Nothing else defines one. There is no list of variants, and no file is edited
+to add one. The same workflows build it, and everything that tells its
+installs apart from the normal app's (name, app id, install directory, data
+directory, address, update feed) is derived from the slug by one file on the
+branch that is built, `autogpt_platform/desktop/src/identity.js`. Its README
+on `desktop`, "Variants", has the table of what each name becomes.
+
+Three rules keep an experiment away from people's data and from the normal
+app's installs. The workflows enforce all three; do not work around them.
+
+- **A variant branch is never built as the normal app.** Built that way, the
+  experiment's code would open the normal app's data directory. A build of
+  `variant/<slug>` (or `refs/heads/variant/<slug>`) takes its slug from the
+  branch name; naming another one is refused. A build that names no variant
+  at all is the normal app, and is refused unless its commit is on `desktop`:
+  a SHA or a tag of a variant branch does not say whose it is. The one
+  exception is a pull request, whose commit is on no branch yet: the caller
+  workflow says which branch it is to be merged into, and it is built as
+  what that branch is (job `Which app`).
+- **A variant's release is always a GitHub pre-release**, tagged
+  `desktop-<slug>-v<version>`. An installed normal app asks GitHub for the
+  repository's *latest* release and for nothing else, and a pre-release is
+  never that. Never untick "pre-release" on a variant's release, and never
+  mark one as latest.
+- **A slug is used once.** Installs of a retired variant keep looking for
+  `desktop-<slug>-v...`; a new experiment under an old slug would update
+  them into itself.
+
+If a variant's release was made the latest by hand, undo it at once (installed
+normal apps refuse it anyway: the files in it are not theirs by name):
+
+```bash
+gh release edit desktop-voice-v0.3.0 --repo ntindle/autogpt --prerelease --latest=false
+gh release edit desktop-v1.2.3 --repo ntindle/autogpt --latest        # the normal app's newest release
+gh api repos/ntindle/autogpt/releases/latest -q .tag_name             # must print: desktop-v1.2.3
+```
+
+### Making one
+
+```bash
+git clone https://github.com/ntindle/autogpt.git && cd autogpt
+git switch -c variant/voice origin/desktop
+# ... the experiment: change anything, anywhere ...
+git push -u origin variant/voice
+```
+
+If the push is refused with "refusing to allow ... to create or update
+workflow", the credential lacks the workflow scope: `gh auth refresh -s workflow`.
+
+The branch carries the caller workflow it inherited from `desktop`, unchanged.
+A push to `variant/**` that touches the desktop app's files, and a pull
+request into such a branch, start `desktop-build.yml` on `main`, which builds
+them as that variant. Upstream's workflow files are on the branch too, as
+they are on `desktop`; they are already disabled, and none of them triggers
+on a branch named `variant/...`.
+
+The names in [Branch names that must never be pushed here](#branch-names-that-must-never-be-pushed-here)
+apply to slugs as well: there is no variant called `dev`.
+
+### Building one
+
+```bash
+gh workflow run desktop-build.yml --repo ntindle/autogpt --ref main -f ref=variant/voice
+# with the installed-app tests:  -f e2e=true
+# one commit of it:              -f ref=<sha> -f variant=voice
+```
+
+With a SHA or a tag, `-f variant=` is not optional: left out, the run stops
+in `Which app` with "Variant refused: ... is not on the desktop branch",
+before anything is built. The same happens to any branch that is neither
+`desktop` nor a `variant/...`; to try an unmerged change to the normal app on
+real machines, open a pull request into `desktop`, or build it under a slug
+of its own. Such a refused run was started by hand and has no "variant" in
+its title, so it is reported in the `upstream-sync` issue as a failed build
+of `desktop`; the next build of `desktop` that passes closes that again.
+
+The installers are in the run's artifacts, named `installers-<system>-voice`.
+They are development builds (`0.0.0-dev.<run number>`): they install as
+*AutoGPT (voice)*, next to anything else, and never look for updates.
+
+A variant's builds are not reported in the `upstream-sync` issue and are not
+part of the nightly run. Look at them with:
+
+```bash
+gh run list --repo ntindle/autogpt --workflow desktop-build.yml --limit 10
+gh run list --repo ntindle/autogpt --branch variant/voice --limit 10
+```
+
+### Releasing one
+
+A release is what makes installed copies of the variant update themselves.
+It is cut like a release of the normal app ([Cutting a release](#cutting-a-release)),
+with the slug:
+
+```bash
+gh workflow run desktop-release.yml --repo ntindle/autogpt --ref main \
+  -f version=0.3.0 -f variant=voice
+# one commit of the branch:   -f ref=<sha>
+# for testing by hand only:   -f version=0.4.0-rc.1 -f prerelease=true
+```
+
+What is the same: the checks before anything is built, the signing
+environment and its certificates (a variant is signed as the same publisher),
+the installed-app tests on eight machines, the draft that is published only
+when every file is there. One release runs at a time, of any app.
+
+What is different:
+
+| | Normal app | Variant `voice` |
+| --- | --- | --- |
+| Built from | a commit of `desktop` | a commit of `variant/voice` |
+| Tag (on `main`) | `desktop-v0.3.0` | `desktop-voice-v0.3.0` |
+| Title | AutoGPT Desktop 0.3.0 | AutoGPT (voice) Desktop 0.3.0 |
+| GitHub release | full, becomes the latest | pre-release, never the latest |
+| Version must be higher than | the latest release | the variant's own highest release |
+| Files | `AutoGPT-Setup-0.3.0-x64.exe`, ... | `AutoGPT-voice-Setup-0.3.0-x64.exe`, ... |
+
+A variant's versions are its own: `voice` can be at 0.3.0 while the normal
+app is at 1.2.3. An installed variant takes the highest `X.Y.Z` among the
+published releases tagged exactly `desktop-voice-v<X.Y.Z>`. A version with a
+`-` part (`0.4.0-rc.1`) gets a release page and is offered to no install, as
+for the normal app.
+
+After a release, check that the normal app's feed did not move:
+
+```bash
+gh api repos/ntindle/autogpt/releases/latest -q .tag_name      # the normal app's tag, or 404 before its first release
+gh release view desktop-voice-v0.3.0 --repo ntindle/autogpt --json isPrerelease,isDraft
+```
+
+**Taking a bad one back.** Make it a draft again. It disappears from what
+installed copies see, they stay on (or are again offered) the previous
+version, and its files, notes and tag are kept:
+
+```bash
+gh release edit desktop-voice-v0.3.0 --repo ntindle/autogpt --draft
+```
+
+Copies that already installed 0.3.0 never go back; fix them with 0.3.1. The
+tag stays, so 0.3.0 is never built again.
+
+### Keeping one in step with `desktop`
+
+The daily sync merges upstream into `desktop` only. A variant gets upstream's
+changes, and the desktop app's, by merging `desktop` into it, by hand, as
+often as the experiment needs. Merge, never rebase: released commits keep
+their SHAs.
+
+```bash
+git fetch origin desktop variant/voice
+git switch variant/voice
+git merge --ff-only origin/variant/voice
+git merge --no-ff origin/desktop
+# resolve conflicts in the files the experiment changed, then the tests of the gate:
+( cd autogpt_platform/desktop && node --test "test/*.test.js" )
+( cd autogpt_platform/desktop/runtime && uv run --python 3.13 --no-project \
+    --with pytest --with pytest-asyncio --with aiohttp --with redis \
+    --with psycopg2-binary --with pika --with psutil --with cryptography \
+    python -m pytest -q )
+git push origin variant/voice
+```
+
+A variant exists to differ from upstream, so the rule that `desktop` changes
+nothing outside `autogpt_platform/desktop/` does not apply to it, and its
+merges will conflict where the experiment and upstream touch the same code.
+That cost is the variant's; it must never be paid on `desktop`. Nothing is
+merged from a variant into `desktop`. An experiment that is to become part of
+the normal app goes there as an ordinary pull request of its own, and what
+changes the platform goes upstream first.
+
+A variant that changes the database schema migrates its own database only.
+Releases of it must still migrate forward from its own earlier releases.
+
+### Retiring one
+
+1. Say so at the top of the notes of its newest release, with what people
+   should move to. Installed copies keep working and stop being updated.
+2. Delete the branch: `gh api -X DELETE repos/ntindle/autogpt/git/refs/heads/variant/voice`.
+3. Keep its releases and tags. Deleting them frees the versions, and with
+   them the one thing that stops a later experiment from reaching the old
+   installs; if the downloads must go, turn the releases into drafts.
+4. Never use the slug again.
+
+Uninstalling a variant removes the app and leaves its data, as for the normal
+app. The data directory is `AutoGPT-<slug>` next to the normal app's
+`AutoGPT` (`%LOCALAPPDATA%`, `~/Library/Application Support`, or
+`~/.local/share`); delete it by hand when the experiment's data is no longer
+wanted.
+
 ## If scheduled runs stop
 
 GitHub disables scheduled workflows in repositories without activity for 60
@@ -839,3 +1043,19 @@ them, except where noted:
   `scripts/release_plan.py`, in the `Version` step of `desktop-build.yml`
   (the tests run both against one list), and in
   `electron-builder.config.js` on `desktop`.
+- Variants. How a slug becomes names is defined once, in
+  `autogpt_platform/desktop/src/identity.js` on the branch that is built.
+  The job `Which app` of `desktop-build.yml` runs that file (it prints
+  `key=value` lines) and hands the names on: `suffix` for artifact names,
+  `product_filename` and `dir_name` for paths, and `artifact_base`,
+  `tag_prefix` and `product_name` to the release. `main` restates two
+  things, and `scripts/tests/test_variants.py` checks both: what a slug may
+  look like (`scripts/release_plan.py` and the `Which app` job, run against
+  one list; `identity.js` has the same rule) and the tag,
+  `desktop-<slug>-v<version>` (`release_plan.py`; the release refuses to
+  publish unless it equals the built commit's `tag_prefix` plus the
+  version). The packaging steps, the installed-app tests and the runtime's
+  unit tests are given the slug as `AUTOGPT_DESKTOP_VARIANT`,
+  and the caller on `desktop` passes `branch`; neither is visible to a test
+  on `main`. `build-report.yml` tells a variant's build by the run title
+  that `desktop-build.yml`'s `run-name` writes.

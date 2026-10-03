@@ -9,6 +9,13 @@ name: Desktop build
 # The workflow lives on `main` and the code on `desktop`, so every checkout
 # names the ref it is given. Nothing is published here.
 #
+# Variants. An experiment branch `variant/<slug>` is built by this same
+# workflow into an app that installs next to the normal one and shares
+# nothing with it (docs/MAINTAINING.md, "Variants"). The `identity` job
+# decides which app a run builds and asks the code being built for that
+# app's names (autogpt_platform/desktop/src/identity.js): nothing here spells
+# out how a variant is named, and no variant is listed anywhere.
+#
 # Signing. Only desktop-release.yml asks for it (`sign`). The certificates
 # are in the `desktop-release` environment, which admits the branch `main`
 # only: a call from `desktop` that set `sign` would be refused by the
@@ -29,6 +36,11 @@ name: Desktop build
 #   sign   in the environment; for a leg with a certificate, takes the
 #          assembled runtime as an archive and only packages and signs it
 
+# What the build-report workflow tells a variant's build from a build of
+# `desktop` by: it only sees this title.
+run-name: >-
+  Desktop build of ${{ inputs.ref }}${{ inputs.variant && format(' as variant {0}', inputs.variant) || '' }}
+
 on:
   workflow_call:
     inputs:
@@ -36,6 +48,14 @@ on:
         description: Branch, tag or commit of this repository to build
         type: string
         default: desktop
+      variant:
+        description: Slug of the variant to build. Empty for the normal app, or to take it from a branch named variant/<slug>.
+        type: string
+        default: ""
+      branch:
+        description: The branch `ref` belongs to, when `ref` is a commit. `variant/<slug>` makes it that variant's build.
+        type: string
+        default: ""
       e2e:
         description: Install the built app on fresh machines and test it
         type: boolean
@@ -52,12 +72,32 @@ on:
         description: Also upload what a release needs besides the installers (update metadata, the macOS zip)
         type: boolean
         default: false
+    outputs:
+      variant:
+        description: The slug of the variant that was built; empty for the normal app
+        value: ${{ jobs.identity.outputs.variant }}
+      suffix:
+        description: What follows the name of every artifact of this build; empty for the normal app
+        value: ${{ jobs.identity.outputs.suffix }}
+      artifact_base:
+        description: What the installers' file names start with
+        value: ${{ jobs.identity.outputs.artifact_base }}
+      tag_prefix:
+        description: What a release tag of this app is, before the version
+        value: ${{ jobs.identity.outputs.tag_prefix }}
+      product_name:
+        description: The app's name as people see it
+        value: ${{ jobs.identity.outputs.product_name }}
   workflow_dispatch:
     inputs:
       ref:
         description: Branch, tag or commit of this repository to build
         type: string
         default: desktop
+      variant:
+        description: Slug of the variant to build. Empty for the normal app, or to take it from a branch named variant/<slug>.
+        type: string
+        default: ""
       e2e:
         description: Install the built app on fresh machines and test it
         type: boolean
@@ -71,8 +111,133 @@ env:
   UV_NO_CACHE: "1"
 
 jobs:
+  # Which app this run builds. A branch named variant/<slug> is that variant
+  # and nothing else: built as the normal app, an experiment's code would
+  # open the normal app's data. A commit can be named in other ways than by
+  # its branch (a SHA, a tag), so a build that names no variant is refused
+  # unless its commit is on `desktop`, or a caller says which branch it is
+  # for: the caller workflow does for pull requests, whose commits are on no
+  # branch yet. The names come from the commit being built, which is the
+  # only definition of them; a commit from before there were variants has no
+  # such file and is the normal app.
+  identity:
+    name: Which app
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      variant: ${{ steps.names.outputs.variant }}
+      suffix: ${{ steps.names.outputs.suffix }}
+      product_name: ${{ steps.names.outputs.product_name }}
+      product_filename: ${{ steps.names.outputs.product_filename }}
+      package_name: ${{ steps.names.outputs.package_name }}
+      dir_name: ${{ steps.names.outputs.dir_name }}
+      artifact_base: ${{ steps.names.outputs.artifact_base }}
+      tag_prefix: ${{ steps.names.outputs.tag_prefix }}
+    steps:
+      - name: Check out the names from ${{ inputs.ref }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+          sparse-checkout: autogpt_platform/desktop/src
+
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      # The normal app is built from `desktop` and from nothing else. A
+      # commit of a variant branch named by its SHA, or by a tag, would
+      # otherwise come out as the normal app with the experiment in it. This
+      # is the one step of the job with a token, and it comes before the
+      # step that runs the commit's own code.
+      - name: Check that the normal app is built from desktop
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VARIANT: ${{ inputs.variant }}
+          BRANCH: ${{ inputs.branch || inputs.ref }}
+          # Empty unless a calling workflow named the branch the build is for.
+          NAMED_BRANCH: ${{ inputs.branch }}
+        run: |
+          refuse() {
+            echo "::error title=Variant refused::$1 See docs/MAINTAINING.md, 'Variants'."
+            exit 1
+          }
+          BRANCH="${BRANCH#refs/heads/}"
+          if [ -n "${VARIANT}" ] || [ -n "${NAMED_BRANCH}" ] || [[ "${BRANCH}" == variant/* ]]; then
+            exit 0
+          fi
+          sha="$(git rev-parse HEAD)"
+          status="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${sha}...desktop" --jq .status)" ||
+            refuse "Could not find out whether ${sha} is a commit of desktop, so it is not built as the normal app."
+          case "${status}" in
+            ahead | identical) ;;
+            *) refuse "${sha} is not on the desktop branch, and only desktop is built as the normal app. To build an experiment, name it: -f variant=<slug>. To try a change to the normal app, open a pull request into desktop." ;;
+          esac
+
+      - name: Name the app
+        id: names
+        shell: bash
+        env:
+          VARIANT: ${{ inputs.variant }}
+          BRANCH: ${{ inputs.branch || inputs.ref }}
+        run: |
+          refuse() {
+            echo "::error title=Variant refused::$1 See docs/MAINTAINING.md, 'Variants'."
+            exit 1
+          }
+          BRANCH="${BRANCH#refs/heads/}"
+          from_branch=""
+          case "${BRANCH}" in
+            variant/*) from_branch="${BRANCH#variant/}" ;;
+          esac
+          if [ -n "${from_branch}" ] && [ -n "${VARIANT}" ] && [ "${VARIANT}" != "${from_branch}" ]; then
+            refuse "The branch ${BRANCH} is the variant '${from_branch}' and cannot be built as '${VARIANT}'."
+          fi
+          variant="${VARIANT:-${from_branch}}"
+          if [ -n "${variant}" ] && ! [[ "${variant}" =~ ^[a-z0-9]([a-z0-9-]{0,22}[a-z0-9])?$ ]]; then
+            refuse "'${variant}' cannot name a variant: use 1 to 24 lower-case letters, digits or hyphens, not starting or ending with a hyphen."
+          fi
+          if [[ "${variant}" =~ (^|-)updater$ ]]; then
+            refuse "'${variant}' cannot name a variant: 'updater' and names ending in '-updater' are the folders of other installs' update downloads."
+          fi
+
+          names=autogpt_platform/desktop/src/identity.js
+          if [ -f "${names}" ]; then
+            AUTOGPT_DESKTOP_VARIANT="${variant}" node "${names}" > names.txt
+          elif [ -z "${variant}" ]; then
+            # A commit from before there were variants: the normal app, as it
+            # was then.
+            printf '%s\n' variant= product_name=AutoGPT product_filename=AutoGPT \
+              package_name=autogpt dir_name=AutoGPT artifact_base=AutoGPT \
+              tag_prefix=desktop-v branch=desktop > names.txt
+          else
+            refuse "This commit has no ${names}: it is older than variants and can only be built as the normal app."
+          fi
+          cat names.txt
+          # The file comes from the commit being built, and its lines end up
+          # in file names and in a release's tag.
+          if grep -qvE '^[a-z_]+=[A-Za-z0-9 ()./_-]*$' names.txt; then
+            refuse "${names} printed something that is not a name."
+          fi
+          for name in variant product_name product_filename package_name dir_name artifact_base tag_prefix; do
+            [ "$(grep -c "^${name}=" names.txt)" = "1" ] || refuse "${names} did not print ${name} exactly once."
+          done
+          grep -qx "variant=${variant}" names.txt || refuse "${names} did not name the variant '${variant}'."
+          {
+            cat names.txt
+            echo "suffix=${variant:+-${variant}}"
+          } >> "${GITHUB_OUTPUT}"
+          if [ -n "${variant}" ]; then
+            echo "Building the variant \`${variant}\`: $(sed -n 's/^product_name=//p' names.txt)" >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
   unit:
     name: Unit tests (${{ matrix.os }})
+    needs: identity
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     strategy:
@@ -105,8 +270,13 @@ jobs:
         working-directory: autogpt_platform/desktop
         run: node --test "test/*.test.js"
 
+      # Told which variant this is, for the one test that has to know: a
+      # variant differs from upstream outside the desktop directory, which
+      # `desktop` itself must never do.
       - name: Runtime tests
         working-directory: autogpt_platform/desktop/runtime
+        env:
+          AUTOGPT_DESKTOP_VARIANT: ${{ needs.identity.outputs.variant }}
         run: >-
           uv run --python 3.13 --no-project
           --with pytest --with pytest-asyncio --with aiohttp --with redis
@@ -232,14 +402,16 @@ jobs:
   build:
     name: Build (${{ matrix.name }})
     # The gate is skipped for every build but a release.
-    needs: [unit, gate]
-    if: ${{ !cancelled() && needs.unit.result == 'success' && (needs.gate.result == 'success' || needs.gate.result == 'skipped') }}
+    needs: [identity, unit, gate]
+    if: ${{ !cancelled() && needs.identity.result == 'success' && needs.unit.result == 'success' && (needs.gate.result == 'success' || needs.gate.result == 'skipped') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: ${{ matrix.timeout }}
     env:
       # How the `sign` job will sign this leg. Empty: nobody signs it, and
       # it is packaged here.
       SIGNED_LATER: ${{ needs.gate.outputs[matrix.signer] }}
+      # The executable's name, and the macOS bundle's.
+      APP_FILE: ${{ needs.identity.outputs.product_filename }}
     strategy:
       fail-fast: false
       matrix:
@@ -479,6 +651,7 @@ jobs:
         if: env.SIGNED_LATER == ''
         env:
           AUTOGPT_DESKTOP_VERSION: ${{ steps.version.outputs.version }}
+          AUTOGPT_DESKTOP_VARIANT: ${{ needs.identity.outputs.variant }}
           # Windows is unsigned and macOS is ad-hoc signed
           # (electron-builder.config.js). electron-builder skips every macOS
           # signature, the ad-hoc one too, on pull requests unless told to.
@@ -491,10 +664,35 @@ jobs:
       - name: Verify the ad-hoc macOS signature
         if: env.SIGNED_LATER == '' && runner.os == 'macOS'
         run: |
-          app=dist/mac-arm64/AutoGPT.app
+          app="dist/mac-arm64/${APP_FILE}.app"
           codesign --verify --deep --strict --verbose=2 "${app}"
           cmp build/runtime/site/claude_agent_sdk/_bundled/claude \
             "${app}/Contents/Resources/runtime/site/claude_agent_sdk/_bundled/claude"
+
+      # An installed app refuses an update unless every file its metadata
+      # names is that app's own installer by name (src/updater.js). The same
+      # code is asked here, so that a build whose files it would refuse
+      # fails now and not as a release nobody is ever offered.
+      - name: Check that installed apps will take these files as an update
+        if: env.SIGNED_LATER == ''
+        env:
+          AUTOGPT_DESKTOP_VARIANT: ${{ needs.identity.outputs.variant }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          shopt -s nullglob
+          metadata=(dist/latest*.yml)
+          if [ "${#metadata[@]}" -eq 0 ] || [ ! -f src/identity.js ]; then
+            echo "No update metadata, or a commit from before this check: nothing to ask."
+            exit 0
+          fi
+          awk '$1 == "-" && $2 == "url:" { print $3 } $1 == "path:" { print $2 }' "${metadata[@]}" | tr -d '\r' | sort -u > update-files.txt
+          cat update-files.txt
+          if [ ! -s update-files.txt ]; then
+            echo "::error::The update metadata names no file."
+            exit 1
+          fi
+          xargs node src/identity.js owns "${VERSION}" < update-files.txt
+          rm update-files.txt
 
       # Before the second packaging run, so that a failure there does not
       # lose the installers that are already built and verified.
@@ -502,7 +700,7 @@ jobs:
         if: env.SIGNED_LATER == ''
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: installers-${{ matrix.key }}
+          name: installers-${{ matrix.key }}${{ needs.identity.outputs.suffix }}
           path: |
             autogpt_platform/desktop/dist/*.exe
             autogpt_platform/desktop/dist/*.dmg
@@ -525,7 +723,7 @@ jobs:
         if: env.SIGNED_LATER == '' && inputs.release_files
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: release-${{ matrix.key }}
+          name: release-${{ matrix.key }}${{ needs.identity.outputs.suffix }}
           path: |
             autogpt_platform/desktop/dist/latest*.yml
             autogpt_platform/desktop/dist/*.blockmap
@@ -566,6 +764,7 @@ jobs:
         if: inputs.e2e
         env:
           AUTOGPT_DESKTOP_VERSION: ${{ steps.version.outputs.next }}
+          AUTOGPT_DESKTOP_VARIANT: ${{ needs.identity.outputs.variant }}
           AUTOGPT_DESKTOP_OUTPUT: dist-upgrade
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
           CSC_FOR_PULL_REQUEST: "true"
@@ -573,7 +772,7 @@ jobs:
           rm -rf dist/win-unpacked dist/mac-arm64 dist/linux-unpacked
           npx electron-builder --config electron-builder.config.js --publish never
           if [ "${RUNNER_OS}" = macOS ]; then
-            codesign --verify --deep --strict --verbose=2 dist-upgrade/mac-arm64/AutoGPT.app
+            codesign --verify --deep --strict --verbose=2 "dist-upgrade/mac-arm64/${APP_FILE}.app"
           fi
           rm -rf dist-upgrade/win-unpacked dist-upgrade/mac-arm64 dist-upgrade/linux-unpacked
           df -h .
@@ -582,7 +781,7 @@ jobs:
         if: inputs.e2e
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: installers-${{ matrix.key }}-upgrade
+          name: installers-${{ matrix.key }}${{ needs.identity.outputs.suffix }}-upgrade
           path: |
             autogpt_platform/desktop/dist-upgrade/*.exe
             autogpt_platform/desktop/dist-upgrade/*.dmg
@@ -611,7 +810,7 @@ jobs:
   # and nothing out of the runtime, which it only copies and signs.
   sign:
     name: Sign (${{ matrix.name }})
-    needs: [gate, build]
+    needs: [identity, gate, build]
     if: ${{ !cancelled() && needs.gate.result == 'success' && needs.build.result == 'success' && needs.gate.outputs.legs != '[]' }}
     runs-on: ${{ matrix.os }}
     # Signing a few thousand files, Apple's notary service with a 2 GB
@@ -630,6 +829,9 @@ jobs:
     env:
       # The build job has checked that this is a version.
       AUTOGPT_DESKTOP_VERSION: ${{ inputs.version || format('0.0.0-dev.{0}', github.run_number) }}
+      # Every step of this job packages or checks the one app.
+      AUTOGPT_DESKTOP_VARIANT: ${{ needs.identity.outputs.variant }}
+      APP_FILE: ${{ needs.identity.outputs.product_filename }}
     steps:
       - name: Check out ${{ inputs.ref }}
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -718,7 +920,7 @@ jobs:
       - name: Verify the Developer ID signature and the notarization
         if: matrix.mode == 'developer-id'
         run: |
-          app=dist/mac-arm64/AutoGPT.app
+          app="dist/mac-arm64/${APP_FILE}.app"
           codesign --verify --deep --strict --verbose=2 "${app}"
           cmp build/runtime/site/claude_agent_sdk/_bundled/claude \
             "${app}/Contents/Resources/runtime/site/claude_agent_sdk/_bundled/claude"
@@ -730,7 +932,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $files = @(Get-ChildItem dist/*.exe) + @(Get-Item dist/win-unpacked/AutoGPT.exe)
+          $files = @(Get-ChildItem dist/*.exe) + @(Get-Item "dist/win-unpacked/$($env:APP_FILE).exe")
           foreach ($file in $files) {
             $signature = Get-AuthenticodeSignature $file
             if ($signature.Status -ne 'Valid') { throw "$($file.Name) is not validly signed: $($signature.Status)" }
@@ -740,10 +942,33 @@ jobs:
           $shipped = (Get-FileHash dist/win-unpacked/resources/runtime/site/claude_agent_sdk/_bundled/claude.exe).Hash
           if ($bundled -ne $shipped) { throw 'The Claude Code CLI was changed by signing.' }
 
+      # An installed app refuses an update unless every file its metadata
+      # names is that app's own installer by name (src/updater.js). The same
+      # code is asked here, so that a build whose files it would refuse
+      # fails now and not as a release nobody is ever offered.
+      - name: Check that installed apps will take these files as an update
+        env:
+          VERSION: ${{ env.AUTOGPT_DESKTOP_VERSION }}
+        run: |
+          shopt -s nullglob
+          metadata=(dist/latest*.yml)
+          if [ "${#metadata[@]}" -eq 0 ] || [ ! -f src/identity.js ]; then
+            echo "No update metadata, or a commit from before this check: nothing to ask."
+            exit 0
+          fi
+          awk '$1 == "-" && $2 == "url:" { print $3 } $1 == "path:" { print $2 }' "${metadata[@]}" | tr -d '\r' | sort -u > update-files.txt
+          cat update-files.txt
+          if [ ! -s update-files.txt ]; then
+            echo "::error::The update metadata names no file."
+            exit 1
+          fi
+          xargs node src/identity.js owns "${VERSION}" < update-files.txt
+          rm update-files.txt
+
       - name: Upload installers
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: installers-${{ matrix.key }}
+          name: installers-${{ matrix.key }}${{ needs.identity.outputs.suffix }}
           path: |
             autogpt_platform/desktop/dist/*.exe
             autogpt_platform/desktop/dist/*.dmg
@@ -761,7 +986,7 @@ jobs:
         if: inputs.release_files
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: release-${{ matrix.key }}
+          name: release-${{ matrix.key }}${{ needs.identity.outputs.suffix }}
           path: |
             autogpt_platform/desktop/dist/latest*.yml
             autogpt_platform/desktop/dist/*.blockmap
@@ -788,7 +1013,7 @@ jobs:
     # `skipped` is the build not having run at all (the unit tests failed).
     if: ${{ !cancelled() && inputs.e2e && needs.build.result != 'skipped' }}
     # A signed leg's installers come from the `sign` job.
-    needs: [build, sign]
+    needs: [identity, build, sign]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     strategy:
@@ -841,7 +1066,11 @@ jobs:
           repository: ${{ github.repository }}
           ref: ${{ inputs.ref }}
           persist-credentials: false
-          sparse-checkout: autogpt_platform/desktop/e2e
+          # The tests take the app's names and paths from the definition
+          # the build uses, src/identity.js.
+          sparse-checkout: |
+            autogpt_platform/desktop/e2e
+            autogpt_platform/desktop/src
 
       - name: Set up Node
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
@@ -852,7 +1081,7 @@ jobs:
       - name: Download installers
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: installers-${{ matrix.installers }}
+          name: installers-${{ matrix.installers }}${{ needs.identity.outputs.suffix }}
           path: ${{ runner.temp }}/installers
 
       # The second packaging run can fail where the first succeeded. The
@@ -862,7 +1091,7 @@ jobs:
         continue-on-error: true
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: installers-${{ matrix.installers }}-upgrade
+          name: installers-${{ matrix.installers }}${{ needs.identity.outputs.suffix }}-upgrade
           path: ${{ runner.temp }}/upgrade
 
       - name: A display and a session bus
@@ -889,6 +1118,8 @@ jobs:
 
       - name: Install, run, upgrade and uninstall the app
         env:
+          # Which app was installed: its paths, its executable, its data.
+          AUTOGPT_DESKTOP_VARIANT: ${{ needs.identity.outputs.variant }}
           AUTOGPT_E2E_KIND: ${{ matrix.kind }}
           AUTOGPT_E2E_INSTALLER: ${{ runner.temp }}/installers
           # Empty skips the upgrade test.
@@ -909,7 +1140,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: e2e-results-${{ matrix.os }}-${{ matrix.kind }}
+          name: e2e-results-${{ matrix.os }}-${{ matrix.kind }}${{ needs.identity.outputs.suffix }}
           path: |
             autogpt_platform/desktop/e2e/test-results/
             autogpt_platform/desktop/e2e/playwright-report/
@@ -920,11 +1151,11 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: e2e-logs-${{ matrix.os }}-${{ matrix.kind }}
+          name: e2e-logs-${{ matrix.os }}-${{ matrix.kind }}${{ needs.identity.outputs.suffix }}
           path: |
-            ~/AppData/Local/AutoGPT/logs/
-            ~/Library/Application Support/AutoGPT/logs/
-            ~/.local/share/AutoGPT/logs/
+            ~/AppData/Local/${{ needs.identity.outputs.dir_name }}/logs/
+            ~/Library/Application Support/${{ needs.identity.outputs.dir_name }}/logs/
+            ~/.local/share/${{ needs.identity.outputs.dir_name }}/logs/
           if-no-files-found: ignore
           retention-days: 7
 
