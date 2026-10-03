@@ -65,7 +65,10 @@
         }
       ],
       "category": "public.app-category.productivity",
-      "artifactName": "AutoGPT-${version}-${arch}.${ext}"
+      "artifactName": "AutoGPT-${version}-${arch}.${ext}",
+      "identity": "-",
+      "hardenedRuntime": false,
+      "gatekeeperAssess": false
     },
     "linux": {
       "target": [

@@ -76,7 +76,7 @@ is set explicitly, as the appliance does.
 | Node 24, Prisma 5.17 engines | upstream | upstream | upstream |
 
 The Linux bundle needs glibc 2.35 and OpenSSL 3 (Ubuntu 22.04, Debian 12,
-Fedora 36, or newer).
+Fedora 36, or newer). The AppImage also needs FUSE 2 (`libfuse2` on Ubuntu).
 
 ## Where data lives
 
@@ -160,9 +160,13 @@ It prints one JSON object per line (`progress`, `ready` with the URL,
   outside Linux.
 - Intel Macs are not supported (a locked dependency ships no x86_64 macOS
   wheel).
-- Not code-signed. Windows SmartScreen warns (*More info* → *Run anyway*).
-  macOS refuses the first launch; allow it under *System Settings → Privacy
-  & Security → Open Anyway*.
+- Not signed by a known publisher. Windows SmartScreen warns (*More info* →
+  *Run anyway*). The macOS build has an ad-hoc signature only: enough for a
+  downloaded copy to count as intact rather than "damaged", not enough to
+  be trusted, so macOS refuses the first launch until it is allowed under
+  *System Settings → Privacy & Security → Open Anyway*.
+- On Linux only the runtime inside the packages has been run; the window
+  itself has not been opened on a Linux desktop yet.
 - No in-place updater yet; installing a newer build over an old one keeps
   the data directory and applies database migrations on first start.
 - The Windows installer takes about ten minutes with Defender's real-time
