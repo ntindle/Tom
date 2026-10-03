@@ -11,6 +11,7 @@ import signal
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import psutil
@@ -33,7 +34,7 @@ def runtime(tmp_path: Path) -> Path:
 
 
 def test_a_directory_a_run_creates_is_a_change_even_when_empty(runtime: Path):
-    before = smoke_test.snapshot(runtime)
+    before = settled(runtime)
     assert smoke_test.changed_files(before, smoke_test.snapshot(runtime)) == []
 
     (runtime / "frontend" / ".next" / "cache" / "images").mkdir(parents=True)
@@ -47,7 +48,7 @@ def test_a_directory_a_run_creates_is_a_change_even_when_empty(runtime: Path):
 def test_a_file_that_came_and_went_during_the_run_is_a_change(runtime: Path):
     """A temporary file, a lock, a pid file: gone by the time the run is
     over, and a write an installed bundle would have refused."""
-    before = smoke_test.snapshot(runtime)
+    before = settled(runtime)
     passing = runtime / "frontend" / ".next" / "server" / "x.tmp"
     make_later_than(runtime / "frontend" / ".next" / "server", lambda: passing.write_text("x"))
     passing.unlink()
@@ -58,10 +59,28 @@ def test_a_file_that_came_and_went_during_the_run_is_a_change(runtime: Path):
 
 
 def test_a_file_in_the_top_of_the_bundle_that_came_and_went_is_a_change(runtime: Path):
-    before = smoke_test.snapshot(runtime)
+    before = settled(runtime)
     make_later_than(runtime, lambda: (runtime / "lock").write_text("x"))
     (runtime / "lock").unlink()
     assert len(smoke_test.changed_files(before, smoke_test.snapshot(runtime))) == 1
+
+
+def settled(runtime: Path) -> dict:
+    """A snapshot of a bundle that was not touched a moment ago. A real one
+    was built minutes before it is run; here it was made in the same tick of
+    a clock that, on Windows, moves every 16 ms, and a directory changed
+    again within that tick keeps the time it had."""
+    past = time.time() - 600
+    for directory in [runtime, *(path for path in runtime.rglob("*") if path.is_dir())]:
+        if not directory.is_symlink() and not is_junction(directory):
+            os.utime(directory, (past, past))
+    return smoke_test.snapshot(runtime)
+
+
+def is_junction(path: Path) -> bool:
+    return sys.platform == "win32" and bool(
+        os.lstat(path).st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    )
 
 
 def make_later_than(directory: Path, change) -> None:
@@ -79,7 +98,7 @@ def test_a_link_a_run_creates_or_repoints_is_a_change(runtime: Path, tmp_path: P
     other.mkdir()
     link = runtime / "frontend" / "link"
     make_link(link, one)
-    before = smoke_test.snapshot(runtime)
+    before = settled(runtime)
     assert before[os.path.join("frontend", "link")][0] == "link"
     assert not any(name.startswith(os.path.join("frontend", "link") + os.sep) for name in before)
 
@@ -92,7 +111,7 @@ def test_a_link_a_run_creates_or_repoints_is_a_change(runtime: Path, tmp_path: P
 
 @posix_only
 def test_a_socket_or_a_pipe_a_run_leaves_is_a_change(runtime: Path):
-    before = smoke_test.snapshot(runtime)
+    before = settled(runtime)
     os.mkfifo(runtime / "frontend" / "pipe")
     (failure,) = smoke_test.changed_files(before, smoke_test.snapshot(runtime))
     assert os.path.join("frontend", "pipe") in failure
@@ -115,7 +134,7 @@ def remove_link(link: Path) -> None:
 
 
 def test_a_file_added_changed_or_removed_is_a_change(runtime: Path):
-    before = smoke_test.snapshot(runtime)
+    before = settled(runtime)
     (runtime / "frontend" / "server.js").write_text("rewritten")
     (runtime / "prisma" / "libquery_engine.so.node").write_text("downloaded")
     (failure,) = smoke_test.changed_files(before, smoke_test.snapshot(runtime))
@@ -124,7 +143,7 @@ def test_a_file_added_changed_or_removed_is_a_change(runtime: Path):
     assert os.path.join("frontend", "server.js") in failure
     assert os.path.join("prisma", "libquery_engine.so.node") in failure
 
-    again = smoke_test.snapshot(runtime)
+    again = settled(runtime)
     (runtime / "prisma" / "libquery_engine.so.node").unlink()
     (failure,) = smoke_test.changed_files(again, smoke_test.snapshot(runtime))
     assert os.path.join("prisma", "libquery_engine.so.node") in failure
@@ -378,7 +397,10 @@ def test_a_process_working_in_the_data_directory_is_of_this_run(tmp_path: Path):
             process.wait(10)
 
 
-BUNDLE = Path(sys.executable).resolve().parent
+# Where this interpreter's image is, as the check sees it for the processes
+# started below. Not sys.executable: a framework build on macOS (GitHub's
+# runners have one) runs Python.app from another directory.
+BUNDLE = Path(psutil.Process().exe()).resolve().parent
 
 
 # --- the links a run leaves outside the data directory ------------------------
