@@ -14,6 +14,12 @@ console.log(JSON.stringify({ event: "ready", url: "http://127.0.0.1:43117" }));
 
 if (mode === "ignore-stdin") {
   setInterval(() => {}, 1000);
+} else if (mode === "slow-stop") {
+  process.stdin.on("end", () => {
+    console.log(JSON.stringify({ event: "progress", message: "Finishing", grace_seconds: 30 }));
+    setTimeout(() => process.exit(0), 1500);
+  });
+  process.stdin.resume();
 } else {
   process.stdin.on("end", () => {
     console.log(JSON.stringify({ event: "progress", message: "stopped" }));

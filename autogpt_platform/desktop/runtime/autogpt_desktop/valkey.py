@@ -8,11 +8,12 @@ gains nothing from the extra memory and processes.
 
 from __future__ import annotations
 
+import contextlib
 import logging
-import os
+import time
 
-from autogpt_desktop.layout import Bundle, DataDir
-from autogpt_desktop.process import ManagedProcess, wait_until
+from autogpt_desktop.layout import Bundle, DataDir, write_private
+from autogpt_desktop.process import ManagedProcess, base_env, wait_until
 
 logger = logging.getLogger("autogpt_desktop")
 
@@ -45,14 +46,24 @@ def write_config(data: DataDir, port: int, bus_port: int, password: str) -> None
         "daemonize no",
         'logfile ""',
     ]
-    (data.valkey / CONFIG_NAME).write_text("\n".join(lines) + "\n", encoding="utf-8")
+    write_private(data.valkey / CONFIG_NAME, "\n".join(lines) + "\n")
+
+
+def set_aside(data: DataDir) -> None:
+    """Move data the server cannot load out of its way. What Valkey holds is
+    caches, locks and replay buffers, so starting empty costs the user
+    nothing, while failing to start costs them the app."""
+    target = data.valkey.with_name(f"valkey.unreadable-{int(time.time())}")
+    data.valkey.rename(target)
+    data.valkey.mkdir()
+    logger.warning(f"Valkey could not load its data; it was moved to {target}")
 
 
 def process(bundle: Bundle, data: DataDir, port: int, password: str) -> ManagedProcess:
     return ManagedProcess(
         name="valkey",
         argv=[str(bundle.valkey_server), CONFIG_NAME],
-        env=dict(os.environ),
+        env=base_env(),
         cwd=data.valkey,
         log_dir=data.logs,
         graceful_stop=lambda _: _shutdown(port, password),
@@ -123,7 +134,5 @@ def _shutdown(port: int, password: str) -> None:
         socket_connect_timeout=3,
         retry=Retry(NoBackoff(), 0),
     )
-    try:
+    with contextlib.suppress(redis.RedisError):
         client.shutdown()
-    except redis.RedisError:
-        pass

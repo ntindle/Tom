@@ -45,4 +45,22 @@ function classifyMainNavigation(url, appUrl) {
   return isExternalLink(url) ? "browser" : "deny";
 }
 
-module.exports = { classifyWindowOpen, classifyMainNavigation };
+// Electron grants every permission a page asks for unless told otherwise, and
+// a sign-in popup can be any site at all. Only the app's own pages get
+// anything, and only what they use: the microphone (voice input, not the
+// camera), notifications, the clipboard and fullscreen.
+const APP_PERMISSIONS = new Set([
+  "media",
+  "notifications",
+  "clipboard-read",
+  "clipboard-sanitized-write",
+  "fullscreen",
+]);
+
+function allowsPermission({ permission, origin, mediaTypes = [] }, appUrl) {
+  if (!sameOrigin(origin, appUrl)) return false;
+  if (permission === "media" && mediaTypes.includes("video")) return false;
+  return APP_PERMISSIONS.has(permission);
+}
+
+module.exports = { classifyWindowOpen, classifyMainNavigation, allowsPermission };

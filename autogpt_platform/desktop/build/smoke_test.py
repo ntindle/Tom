@@ -11,6 +11,7 @@ and no process from the bundle left running.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import subprocess
@@ -23,6 +24,10 @@ import urllib.request
 from pathlib import Path
 
 import psutil
+
+# The shell kills a runtime that takes a minute to stop (src/runtime.js); a
+# stop that would not survive that with room to spare is a failure here.
+STOP_BUDGET_SECONDS = 30
 
 
 def main() -> int:
@@ -56,10 +61,12 @@ def main() -> int:
     assert process.stdin
     process.stdin.close()
     try:
-        code = process.wait(90)
+        code = process.wait(STOP_BUDGET_SECONDS)
     except subprocess.TimeoutExpired:
         process.kill()
-        failures.append("the runtime did not stop within 90s of stdin closing")
+        failures.append(
+            f"the runtime did not stop within {STOP_BUDGET_SECONDS}s of stdin closing"
+        )
         code = None
     if code not in (0, None):
         failures.append(f"the runtime exited with code {code}")
@@ -70,10 +77,8 @@ def main() -> int:
         names = sorted({leftover.info["name"] for leftover in leftovers})
         failures.append(f"processes left running: {names}")
         for leftover in leftovers:  # do not leave the machine dirty
-            try:
+            with contextlib.suppress(psutil.Error):
                 leftover.kill()
-            except psutil.Error:
-                pass
 
     if failures:
         print("\nFAILED")

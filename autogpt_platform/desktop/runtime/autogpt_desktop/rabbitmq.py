@@ -13,12 +13,13 @@ import hashlib
 import logging
 import os
 import secrets
+import socket
 import sys
 import tempfile
 from pathlib import Path
 
-from autogpt_desktop.layout import EXE, SCRIPT, Bundle, DataDir
-from autogpt_desktop.process import ManagedProcess, run_tool
+from autogpt_desktop.layout import EXE, SCRIPT, Bundle, DataDir, write_private
+from autogpt_desktop.process import ManagedProcess, base_env, run_tool
 
 NODE_NAME = "rabbit@localhost"
 INETRC_NAME = "erl_inetrc"
@@ -35,7 +36,8 @@ WINDOWS = sys.platform == "win32"
 def prepare(data: DataDir, port: int, user: str, password: str) -> None:
     base = data.rabbitmq
     (base / "mnesia").mkdir(parents=True, exist_ok=True)
-    (base / "rabbitmq.conf").write_text(
+    write_private(
+        base / "rabbitmq.conf",
         "\n".join(
             [
                 f"listeners.tcp.default = 127.0.0.1:{port}",
@@ -50,7 +52,6 @@ def prepare(data: DataDir, port: int, user: str, password: str) -> None:
             ]
         )
         + "\n",
-        encoding="utf-8",
     )
     (base / "enabled_plugins").write_text("[].\n", encoding="utf-8")
     # The node is named rabbit@localhost. Answer that name from a static
@@ -72,7 +73,10 @@ def environment(bundle: Bundle, data: DataDir, ports: dict[str, int]) -> dict[st
     base = _short(data.rabbitmq)
     erlang = _short(bundle.erlang_home)
     env = {
-        **os.environ,
+        # Not the user's whole environment: Erlang and RabbitMQ read dozens of
+        # variables (ERL_FLAGS, RABBITMQ_NODE_PORT, ...) that an Erlang
+        # developer may have set, and any of them could undo the wiring below.
+        **base_env(),
         "PATH": os.pathsep.join([str(Path(erlang) / "bin"), os.environ.get("PATH", "")]),
         "ERLANG_HOME": erlang,
         "RABBITMQ_HOME": _short(bundle.rabbitmq_home),
@@ -130,6 +134,30 @@ def process(bundle: Bundle, data: DataDir, ports: dict[str, int]) -> ManagedProc
     )
 
 
+def epmd_process(bundle: Bundle, data: DataDir, ports: dict[str, int]) -> ManagedProcess:
+    """Erlang's port mapper, which RabbitMQ and rabbitmqctl find each other
+    through. Left alone, the first Erlang VM starts one as a daemon that
+    outlives everything and that nothing here would know to stop. Started
+    first and in the foreground it is a child like any other, and the VMs
+    use the one they find running."""
+    epmd = next(bundle.erlang_home.glob(f"erts-*/bin/epmd{EXE}"))
+    return ManagedProcess(
+        name="epmd",
+        argv=[str(epmd)],
+        env=environment(bundle, data, ports),
+        cwd=data.rabbitmq,
+        log_dir=data.logs,
+    )
+
+
+def epmd_is_ready(port: int) -> bool:
+    try:
+        socket.create_connection(("127.0.0.1", port), timeout=1).close()
+        return True
+    except OSError:
+        return False
+
+
 def is_ready(port: int, user: str, password: str) -> bool:
     import pika
     import pika.exceptions
@@ -159,10 +187,6 @@ def _stop(bundle: Bundle, env: dict[str, str]) -> None:
         capture_output=True,
         timeout=25,
     )
-    # Erlang leaves its port mapper daemon running after the node exits.
-    epmd = next(bundle.erlang_home.glob(f"erts-*/bin/epmd{EXE}"), None)
-    if epmd:
-        run_tool([str(epmd), "-kill"], env=env, capture_output=True, timeout=10)
 
 
 def _script(bundle: Bundle, name: str) -> str:
@@ -183,16 +207,28 @@ def _short(path: Path) -> str:
         return _windows_short_name(path)
     if not any(character.isspace() for character in str(path)):
         return str(path)
-    # A symlink in a per-user temp directory, whose own path (/tmp, or
-    # /var/folders/... on macOS) has no spaces.
-    root = Path(tempfile.gettempdir()) / f"autogpt-desktop-{os.getuid()}"
-    root.mkdir(mode=0o700, exist_ok=True)
-    link = root / hashlib.sha256(str(path).encode()).hexdigest()[:16]
+    link = _alias_root() / hashlib.sha256(str(path).encode()).hexdigest()[:16]
     if link.is_symlink() and Path(os.readlink(link)) != path:
         link.unlink()
     if not link.is_symlink():
         link.symlink_to(path, target_is_directory=True)
     return str(link)
+
+
+def _alias_root() -> Path:
+    """Where the space-free symlinks live: the user's cache directory. Not
+    the temp directory, which macOS and systemd clear of anything untouched
+    for a few days; the broker would lose its data path while running."""
+    assert sys.platform != "win32"
+    if sys.platform == "darwin":
+        cache = Path.home() / "Library" / "Caches"
+    else:
+        cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+    root = cache / "AutoGPT" / "links"
+    if any(character.isspace() for character in str(root)):
+        root = Path(tempfile.gettempdir()) / f"autogpt-desktop-{os.getuid()}"
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return root
 
 
 def _windows_short_name(path: Path) -> str:
@@ -202,4 +238,13 @@ def _windows_short_name(path: Path) -> str:
 
     buffer = ctypes.create_unicode_buffer(32768)
     length = ctypes.windll.kernel32.GetShortPathNameW(str(path), buffer, len(buffer))
-    return buffer.value if 0 < length < len(buffer) else str(path)
+    short = buffer.value if 0 < length < len(buffer) else str(path)
+    if any(character.isspace() for character in short):
+        # Short names can be switched off per drive, and usually are on
+        # drives other than the system one.
+        raise RuntimeError(
+            f"AutoGPT cannot run from a folder with a space in its name ({path}) "
+            "on a drive that has short file names turned off. Install it on the "
+            "system drive, or in a folder without spaces."
+        )
+    return short

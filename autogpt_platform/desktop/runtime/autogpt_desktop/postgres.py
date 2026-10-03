@@ -8,10 +8,14 @@ loopback TCP; and the port is whatever ports.py picked.
 from __future__ import annotations
 
 import os
+import re
 import secrets
+import shutil
 import signal
 import subprocess
 import sys
+
+from pathlib import Path
 
 from autogpt_desktop.layout import Bundle, DataDir
 from autogpt_desktop.process import ManagedProcess, run_tool, send_posix_signal
@@ -19,8 +23,49 @@ from autogpt_desktop.process import ManagedProcess, run_tool, send_posix_signal
 CONFIG_MARKER = "# autogpt-desktop"
 
 
+class IncompatibleDataError(RuntimeError):
+    pass
+
+
 def is_initialized(data: DataDir) -> bool:
-    return (data.postgres / "PG_VERSION").is_file()
+    return (data.postgres / "PG_VERSION").is_file() and not _first_run_marker(data).exists()
+
+
+def first_run_completed(data: DataDir) -> None:
+    _first_run_marker(data).unlink(missing_ok=True)
+
+
+def _first_run_marker(data: DataDir) -> Path:
+    """Present from before the database is created until its tables exist.
+
+    A first start that is cut short (the app closed, the machine switched
+    off) leaves a database nobody has used yet, possibly half-migrated, and
+    Prisma will not continue a migration it did not finish. While the marker
+    exists there is nothing in the database to lose, so the next start
+    creates it again from scratch instead of refusing to run.
+    """
+    return data.config / "first-run.incomplete"
+
+
+def check_compatible(bundle: Bundle, data: DataDir) -> None:
+    """PostgreSQL only opens data written by its own major version."""
+    version_file = data.postgres / "PG_VERSION"
+    if not version_file.is_file():
+        return
+    stored = version_file.read_text(encoding="ascii").strip()
+    result = run_tool(
+        [str(bundle.postgres_bin("postgres")), "--version"],
+        capture_output=True,
+        env=_tool_env(bundle),
+    )
+    match = re.search(r"(\d+)\.", result.stdout.decode(errors="replace"))
+    if match and match.group(1) != stored:
+        raise IncompatibleDataError(
+            f"Your AutoGPT data was created with PostgreSQL {stored}, and this version "
+            f"of AutoGPT includes PostgreSQL {match.group(1)}, which cannot open it. "
+            "Install the AutoGPT version you used before to keep your data, or move "
+            f"{data.postgres} away to start again without it."
+        )
 
 
 def initialize(bundle: Bundle, data: DataDir, password: str) -> None:
@@ -28,6 +73,10 @@ def initialize(bundle: Bundle, data: DataDir, password: str) -> None:
     pgdata = data.postgres
     if is_initialized(data):
         return
+    marker = _first_run_marker(data)
+    if marker.exists():
+        shutil.rmtree(pgdata, ignore_errors=True)
+    marker.touch()
     password_file = data.run / f"postgres-password.{secrets.token_hex(8)}"
     descriptor = os.open(password_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(descriptor, "w", encoding="utf-8") as stream:

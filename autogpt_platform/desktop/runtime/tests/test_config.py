@@ -1,11 +1,13 @@
 import json
 import socket
+import stat
 import sys
+import threading
 from pathlib import Path
 
 import pytest
 
-from autogpt_desktop import ports, settings, valkey
+from autogpt_desktop import ports, rabbitmq, settings, valkey
 from autogpt_desktop.layout import Bundle, DataDir
 
 DESKTOP = Path(__file__).resolve().parents[2]
@@ -36,7 +38,8 @@ def test_ports_are_unique_in_range_and_remembered(tmp_path: Path):
     assert ports.allocate(path) == first
 
 
-def test_a_taken_port_is_replaced_and_the_rest_are_kept(tmp_path: Path):
+def test_a_taken_port_is_replaced_and_the_rest_are_kept(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(ports, "PUBLIC_PORT_PATIENCE_SECONDS", 0)
     path = tmp_path / "ports.json"
     first = ports.allocate(path)
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as squatter:
@@ -47,6 +50,18 @@ def test_a_taken_port_is_replaced_and_the_rest_are_kept(tmp_path: Path):
         k: v for k, v in first.items() if k != "public"
     }
     assert json.loads(path.read_text()) == second
+
+
+def test_the_public_port_is_waited_for_before_it_is_given_up(tmp_path: Path):
+    """It is the app's origin: sessions and OAuth redirect URIs hang off it,
+    and its usual holder is a previous run that is still shutting down."""
+    path = tmp_path / "ports.json"
+    first = ports.allocate(path)
+    squatter = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    squatter.bind(("127.0.0.1", first["public"]))
+    threading.Timer(1, squatter.close).start()
+
+    assert ports.allocate(path) == first
 
 
 def test_secrets_are_generated_once(bundle: Bundle, data: DataDir):
@@ -79,6 +94,52 @@ def test_user_settings_cannot_override_the_runtime_wiring(bundle: Bundle, data: 
     env = settings.backend_environment(bundle, data, port, secret, user)
     assert env["OPEN_ROUTER_API_KEY"] == "sk-user"
     assert "elsewhere" not in env["DATABASE_URL"]
+
+
+def test_registration_is_open_until_the_user_closes_it(bundle: Bundle, data: DataDir):
+    secret = settings.ensure_secrets(bundle, data)
+    port = ports.allocate(data.ports_file)
+
+    def allowed(user: dict[str, str]) -> str:
+        backend = settings.backend_environment(bundle, data, port, secret, user)
+        frontend = settings.frontend_environment(backend, port, secret, data)
+        assert frontend["AUTH_ALLOW_NEW_ACCOUNTS"] == backend["AUTH_ALLOW_NEW_ACCOUNTS"]
+        return backend["AUTH_ALLOW_NEW_ACCOUNTS"]
+
+    assert allowed({}) == "true"
+    assert allowed({"AUTH_ALLOW_NEW_ACCOUNTS": "false"}) == "false"
+
+
+def test_services_get_a_home_of_their_own(bundle: Bundle, data: DataDir):
+    """AutoPilot's coding agents keep their sign-in under the home directory;
+    the app must not find the user's personal one there."""
+    secret = settings.ensure_secrets(bundle, data)
+    port = ports.allocate(data.ports_file)
+    backend = settings.backend_environment(bundle, data, port, secret, {})
+    frontend = settings.frontend_environment(backend, port, secret, data)
+
+    assert backend["HOME"] == str(data.home)
+    assert backend["CLAUDE_CONFIG_DIR"] == str(data.home / ".claude")
+    assert backend["CODEX_HOME"] == str(data.home / ".codex")
+    assert frontend["HOME"] == str(data.frontend_home)
+    if sys.platform == "win32":  # where HOME is ignored
+        assert backend["USERPROFILE"] == str(data.home)
+        assert frontend["USERPROFILE"] == str(data.frontend_home)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the user profile's ACL covers this")
+def test_files_holding_secrets_are_readable_by_their_owner_only(data: DataDir):
+    settings.read_user_settings(data)
+    valkey.write_config(data, 20000, 20001, "secret" * 8)
+    rabbitmq.prepare(data, 20002, "autogpt", "secret" * 8)
+
+    def mode(path: Path) -> int:
+        return stat.S_IMODE(path.stat().st_mode)
+
+    assert mode(data.root) == 0o700
+    assert mode(data.config / "settings.env") == 0o600
+    assert mode(data.valkey / valkey.CONFIG_NAME) == 0o600
+    assert mode(data.rabbitmq / "rabbitmq.conf") == 0o600
 
 
 def test_user_settings_file_is_created_and_blank_values_are_ignored(data: DataDir):

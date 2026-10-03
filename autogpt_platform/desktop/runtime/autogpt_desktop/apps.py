@@ -9,10 +9,8 @@ break as soon as the app bundle is moved.
 
 from __future__ import annotations
 
-import os
-
 from autogpt_desktop.layout import Bundle, DataDir
-from autogpt_desktop.process import ManagedProcess
+from autogpt_desktop.process import ManagedProcess, base_env
 
 # (process name, entry point) in the appliance's start order.
 BACKEND_SERVICES = (
@@ -28,6 +26,13 @@ BACKEND_SERVICES = (
 
 SKILLS_CATALOG_ENTRY = "backend.cli.publish_skills_catalog:main"
 
+# How long a service gets between being asked to stop and being killed. The
+# appliance measured this (single-container/supervisor/supervisord.conf): a
+# service finishes its own cleanup well inside a second, then sits in
+# third-party telemetry teardown for several more, so waiting longer buys
+# nothing. On Windows the question does not arise; there the ask is the kill.
+STOP_TIMEOUT_SECONDS = 3
+
 
 def backend_processes(
     bundle: Bundle, data: DataDir, env: dict[str, str]
@@ -39,7 +44,7 @@ def backend_processes(
             env={**base_env(), **env},
             cwd=bundle.backend_dir,
             log_dir=data.logs,
-            stop_timeout=5,
+            stop_timeout=STOP_TIMEOUT_SECONDS,
         )
         for name, entry in BACKEND_SERVICES
     ]
@@ -52,7 +57,7 @@ def frontend_process(bundle: Bundle, data: DataDir, env: dict[str, str]) -> Mana
         env={**base_env(), **env, "ELECTRON_RUN_AS_NODE": "1"},
         cwd=bundle.frontend_server.parent,
         log_dir=data.logs,
-        stop_timeout=5,
+        stop_timeout=STOP_TIMEOUT_SECONDS,
     )
 
 
@@ -60,31 +65,3 @@ def entry_point_argv(bundle: Bundle, entry: str, *args: str) -> list[str]:
     module, _, function = entry.partition(":")
     code = f"import sys; from {module} import {function} as m; sys.exit(m())"
     return [str(bundle.python), "-c", code, *args]
-
-
-def base_env() -> dict[str, str]:
-    """What a child needs from the user's environment to function at all
-    (system paths, temp dirs, locale on Windows), without inheriting
-    AutoGPT settings the user may have exported for some other checkout."""
-    keep = (
-        "PATH",
-        "SYSTEMROOT",
-        "SystemRoot",
-        "WINDIR",
-        "COMSPEC",
-        "PATHEXT",
-        "TEMP",
-        "TMP",
-        "TMPDIR",
-        "USERPROFILE",
-        "LOCALAPPDATA",
-        "APPDATA",
-        "PROGRAMDATA",
-        "USERNAME",
-        "USER",
-        "LOGNAME",
-        "LANG",
-        "SSL_CERT_FILE",
-        "AUTOGPT_DESKTOP_NODE",
-    )
-    return {name: os.environ[name] for name in keep if name in os.environ}

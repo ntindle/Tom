@@ -10,14 +10,19 @@ sessions and OAuth redirect URIs are tied to.
 from __future__ import annotations
 
 import json
+import logging
 import random
 import socket
+import time
 from pathlib import Path
+
+logger = logging.getLogger("autogpt_desktop")
 
 # Below the ephemeral range of every supported OS (Linux starts at 32768,
 # Windows and macOS at 49152), so a remembered port is never handed out to
 # some other program's outbound connection between boots.
 PORT_RANGE = range(15000, 32000)
+PUBLIC_PORT_PATIENCE_SECONDS = 5
 
 PORT_NAMES = (
     "public",
@@ -46,8 +51,12 @@ def allocate(path: Path, names: tuple[str, ...] = PORT_NAMES) -> dict[str, int]:
     ports: dict[str, int] = {}
     for name in names:
         port = stored.get(name)
-        if not (isinstance(port, int) and _is_free(port) and port not in ports.values()):
+        if not (isinstance(port, int) and _is_free(port, wait=name == "public")):
+            port = None
+        if port is None or port in ports.values():
             port = _free_port(exclude=set(ports.values()))
+            if name in stored:
+                logger.warning(f"the {name} port {stored[name]} is taken; using {port}")
         ports[name] = port
     if ports != stored:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -63,15 +72,23 @@ def _read(path: Path) -> dict[str, object]:
     return value if isinstance(value, dict) else {}
 
 
-def _is_free(port: int) -> bool:
+def _is_free(port: int, *, wait: bool = False) -> bool:
+    """`wait` gives a busy port a few seconds to come free before giving up
+    on it. Worth it for the public port only: moving that one signs the user
+    out and breaks the redirect URIs of their OAuth apps, and the usual
+    holder is a previous run of this app that is still shutting down."""
     if port not in PORT_RANGE:
         return False
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        try:
-            probe.bind(("127.0.0.1", port))
-        except OSError:
-            return False
-    return True
+    deadline = time.monotonic() + (PUBLIC_PORT_PATIENCE_SECONDS if wait else 0)
+    while True:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            try:
+                probe.bind(("127.0.0.1", port))
+                return True
+            except OSError:
+                if time.monotonic() >= deadline:
+                    return False
+        time.sleep(0.25)
 
 
 def _free_port(exclude: set[int]) -> int:

@@ -2,9 +2,19 @@
 
 const fs = require("node:fs");
 const path = require("node:path");
-const { app, BrowserWindow, Menu, Tray, dialog, ipcMain, nativeImage, shell } = require("electron");
+const {
+  app,
+  BrowserWindow,
+  Menu,
+  Tray,
+  dialog,
+  ipcMain,
+  nativeImage,
+  session,
+  shell,
+} = require("electron");
 
-const { classifyMainNavigation, classifyWindowOpen } = require("./navigation");
+const { allowsPermission, classifyMainNavigation, classifyWindowOpen } = require("./navigation");
 const { defaultDataDir, readRuntimeManifest, runtimeDir } = require("./paths");
 const { Runtime } = require("./runtime");
 
@@ -32,6 +42,7 @@ if (!app.requestSingleInstanceLock()) {
 
 function boot() {
   fs.mkdirSync(logsDir, { recursive: true });
+  restrictPermissions(session.defaultSession);
   Menu.setApplicationMenu(applicationMenu());
   createTray();
   showStartupWindow();
@@ -153,12 +164,26 @@ function routeNewWindows(contents) {
 }
 
 function keepMainWindowInApp(window) {
-  window.webContents.on("will-navigate", (event, url) => {
+  function route(event, url) {
     const destination = classifyMainNavigation(url, appUrl);
     if (destination === "app") return;
     event.preventDefault();
     if (destination === "browser") shell.openExternal(url);
+  }
+  window.webContents.on("will-navigate", route);
+  // One of the app's own links can answer with a redirect to another site.
+  window.webContents.on("will-redirect", route);
+}
+
+// See navigation.js for what is allowed and why.
+function restrictPermissions(target) {
+  target.setPermissionRequestHandler((contents, permission, callback, details) => {
+    const origin = details.requestingUrl || contents.getURL();
+    callback(allowsPermission({ permission, origin, mediaTypes: details.mediaTypes }, appUrl));
   });
+  target.setPermissionCheckHandler((_contents, permission, origin, details) =>
+    allowsPermission({ permission, origin, mediaTypes: [details.mediaType] }, appUrl),
+  );
 }
 
 // The backend is gone, so the page in the window can only fail from here on.

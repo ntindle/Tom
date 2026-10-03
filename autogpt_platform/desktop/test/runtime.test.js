@@ -60,8 +60,12 @@ test("an unexpected exit is reported as not expected", async () => {
   assert.ok(events.some((event) => event.event === "error" && event.fatal));
 });
 
-test("a runtime that ignores stdin is killed after the grace period", { timeout: 40_000 }, async () => {
-  const runtime = new Runtime({ command: process.execPath, args: [FAKE, "ignore-stdin"] });
+test("a runtime that ignores stdin is killed after the grace period", async () => {
+  const runtime = new Runtime({
+    command: process.execPath,
+    args: [FAKE, "ignore-stdin"],
+    stopGraceMs: 1_500,
+  });
   const ready = new Promise((resolve) =>
     runtime.on("event", (event) => event.event === "ready" && resolve()),
   );
@@ -69,7 +73,35 @@ test("a runtime that ignores stdin is killed after the grace period", { timeout:
   await ready;
   const started = Date.now();
   await runtime.stop();
-  assert.ok(Date.now() - started >= 19_000);
+  assert.ok(Date.now() - started >= 1_400);
+});
+
+test("a runtime that asks for more time to stop is given it", async () => {
+  const runtime = new Runtime({
+    command: process.execPath,
+    args: [FAKE, "slow-stop"],
+    stopGraceMs: 500,
+  });
+  const ready = new Promise((resolve) =>
+    runtime.on("event", (event) => event.event === "ready" && resolve()),
+  );
+  const exit = new Promise((resolve) => runtime.once("exit", resolve));
+  runtime.start();
+  await ready;
+  await runtime.stop();
+
+  assert.deepEqual(await exit, { code: 0, signal: null, expected: true });
+});
+
+test("a runtime that cannot be started is reported, and stopping it does not hang", async () => {
+  const runtime = new Runtime({ command: path.join(__dirname, "no-such-runtime") });
+  const { events } = collect(runtime);
+  const exit = new Promise((resolve) => runtime.once("exit", resolve));
+  runtime.start();
+
+  assert.equal((await exit).expected, false);
+  assert.ok(events.some((event) => event.event === "error" && event.fatal));
+  await runtime.stop();
 });
 
 test("runtime output is appended to the log file", async () => {
@@ -112,14 +144,82 @@ test("manifest commands resolve relative to the runtime directory", () => {
   assert.deepEqual(mac.env, { A: `${dir}/a` });
 });
 
-test("services recorded by a runtime that had to be killed are killed too", async () => {
-  const service = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
-  const exited = new Promise((resolve) => service.once("exit", (code, signal) => resolve(signal || code)));
+// The runtime starts each service as the leader of its own process group.
+function spawnService(script) {
+  return spawn(process.execPath, ["-e", script], {
+    stdio: ["ignore", "pipe", "ignore"],
+    detached: true,
+    windowsHide: true,
+  });
+}
+
+function writeRegistry(entries) {
   const registry = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "agpt-registry-")), "children.json");
-  fs.writeFileSync(registry, JSON.stringify([{ name: "service", pid: service.pid }, { name: "gone", pid: 999999 }]));
+  fs.writeFileSync(registry, JSON.stringify(entries));
+  return registry;
+}
+
+function isRunning(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitUntil(predicate, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate() && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return predicate();
+}
+
+test("services recorded by a runtime that had to be killed are killed too", async () => {
+  const service = spawnService("setInterval(() => {}, 1000)");
+  const exited = new Promise((resolve) => service.once("exit", (code, signal) => resolve(signal || code)));
+  const registry = writeRegistry([{ name: "service", pid: service.pid }, { name: "gone", pid: 999999 }]);
 
   killRecorded(registry);
 
   assert.ok(await exited);
   assert.doesNotThrow(() => killRecorded(path.join(os.tmpdir(), "no-such-registry.json")));
+});
+
+test(
+  "what a recorded service started is killed with it",
+  { skip: process.platform === "win32" && "Windows relies on the runtime's Job Object" },
+  async () => {
+    // Like rabbitmq-server: a launcher that starts the real process and waits.
+    const launcher = spawnService(`
+      const child = require("node:child_process").spawn(
+        process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+      console.log(child.pid);
+      setInterval(() => {}, 1000);
+    `);
+    const [line] = await require("node:events").once(
+      require("node:readline").createInterface({ input: launcher.stdout }),
+      "line",
+    );
+    const started = Number(line);
+    assert.ok(isRunning(started));
+
+    killRecorded(writeRegistry([{ name: "launcher", pid: launcher.pid }]));
+
+    assert.ok(await waitUntil(() => !isRunning(started)));
+  },
+);
+
+test("a runtime that dies takes its recorded services with it", async () => {
+  const service = spawnService("setInterval(() => {}, 1000)");
+  const exited = new Promise((resolve) => service.once("exit", (code, signal) => resolve(signal || code)));
+  const runtime = new Runtime({
+    command: process.execPath,
+    args: [FAKE, "crash"],
+    registryFile: writeRegistry([{ name: "service", pid: service.pid }]),
+  });
+  runtime.start();
+
+  assert.ok(await exited);
 });

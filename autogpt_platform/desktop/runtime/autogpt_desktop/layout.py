@@ -20,6 +20,7 @@ each Linux path replaced by a directory under the runtime root:
 from __future__ import annotations
 
 import os
+import secrets
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -166,6 +167,11 @@ class DataDir:
         return self.root / "frontend-home"
 
     def prepare(self) -> None:
+        # Private to the user: it holds the database, API keys and logs, and
+        # on Linux ~/.local/share is usually readable by everyone.
+        self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if not WINDOWS:
+            self.root.chmod(0o700)
         for path in (
             self.config,
             self.postgres.parent,
@@ -181,3 +187,13 @@ class DataDir:
             self.frontend_home,
         ):
             path.mkdir(parents=True, exist_ok=True)
+
+
+def write_private(path: Path, content: str) -> None:
+    """Write a file only its owner can read, replacing it atomically."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        stream.write(content)
+    os.replace(temporary, path)

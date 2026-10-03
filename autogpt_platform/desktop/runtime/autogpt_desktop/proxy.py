@@ -221,7 +221,11 @@ class ProxyThread:
     def _run(self) -> None:
         asyncio.set_event_loop(self.loop)
         try:
-            self.runner = web.AppRunner(build_app(self.upstreams), access_log=None)
+            # The window's websocket is still open when the app quits, and
+            # aiohttp would wait a minute for it to finish on its own.
+            self.runner = web.AppRunner(
+                build_app(self.upstreams), access_log=None, shutdown_timeout=1
+            )
             self.loop.run_until_complete(self.runner.setup())
             site = web.TCPSite(self.runner, "127.0.0.1", self.port)
             self.loop.run_until_complete(site.start())

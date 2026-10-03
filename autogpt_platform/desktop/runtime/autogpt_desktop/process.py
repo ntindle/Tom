@@ -6,19 +6,24 @@ desktop has no such boundary, so it is rebuilt here:
 * Windows: the runtime joins a Job Object with KILL_ON_JOB_CLOSE before it
   starts anything. Children inherit the job, and Windows kills all of them
   the moment the runtime's last handle closes, crash or not.
-* POSIX: each child gets its own session (a terminal's Ctrl+C reaches only
-  the runtime, which then stops services in order), and every child's
-  (pid, start time) is recorded so the next boot can kill leftovers from a
-  runtime that was SIGKILLed.
+* POSIX: each child leads its own session, so a terminal's Ctrl+C reaches
+  only the runtime (which then stops services in order) and a child can be
+  killed together with whatever it started: the process that matters is
+  often not the one launched (rabbitmq-server is a shell script that waits
+  on the Erlang VM). Every child's (pid, start time) is recorded so that
+  the shell, or the next boot, can kill what a dead runtime left running.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
+import signal
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -47,6 +52,8 @@ class ManagedProcess:
     popen: subprocess.Popen[bytes] | None = field(default=None, repr=False)
 
     def start(self) -> None:
+        if self.popen:  # a restart: nothing of the previous run may linger
+            self.kill()
         log_path = self.log_dir / f"{self.name}.log"
         _rotate(log_path)
         logger.info(f"starting {self.name}")
@@ -80,10 +87,38 @@ class ManagedProcess:
             else:
                 self.popen.terminate()
             self.popen.wait(self.stop_timeout)
+        except subprocess.TimeoutExpired:
+            logger.info(f"{self.name} was still running after {self.stop_timeout:g}s")
         except Exception as exc:  # the process is going away regardless
             logger.warning(f"{self.name} did not stop cleanly ({exc}); killing it")
-            self.popen.kill()
+        # Also after a clean exit: a service's own children (a coding agent's
+        # CLI, a browser) must not carry on without it.
+        self.kill()
+        with contextlib.suppress(subprocess.TimeoutExpired):
             self.popen.wait(5)
+
+    def kill(self) -> None:
+        """The process and, on POSIX, everything in its session."""
+        if not self.popen:
+            return
+        if sys.platform == "win32":
+            self.popen.kill()
+            return
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(self.popen.pid, signal.SIGKILL)
+
+
+def stop_together(processes: list[ManagedProcess]) -> None:
+    """Stop processes that do not depend on each other, all at once. One at a
+    time, eight services that each take two seconds to exit take sixteen."""
+    threads = [
+        threading.Thread(target=process.stop, name=f"stop-{process.name}")
+        for process in processes
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
 
 
 def adopt_kill_on_exit_job() -> None:
@@ -147,6 +182,39 @@ def adopt_kill_on_exit_job() -> None:
     _job_handle = job
 
 
+def base_env() -> dict[str, str]:
+    """What a child needs from the user's environment to function at all
+    (system paths, temp dirs, locale on Windows), without inheriting settings
+    the user may have exported for something else: AutoGPT variables from a
+    source checkout, or ERL_FLAGS from their own Erlang work."""
+    keep = (
+        "PATH",
+        "SYSTEMROOT",
+        "SystemRoot",
+        "SYSTEMDRIVE",
+        "WINDIR",
+        "COMSPEC",
+        "PATHEXT",
+        "PROCESSOR_ARCHITECTURE",
+        "NUMBER_OF_PROCESSORS",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "USERPROFILE",
+        "LOCALAPPDATA",
+        "APPDATA",
+        "PROGRAMDATA",
+        "ALLUSERSPROFILE",
+        "USERNAME",
+        "USER",
+        "LOGNAME",
+        "LANG",
+        "SSL_CERT_FILE",
+        "AUTOGPT_DESKTOP_NODE",
+    )
+    return {name: os.environ[name] for name in keep if name in os.environ}
+
+
 def run_tool(argv: list[str], **kwargs) -> subprocess.CompletedProcess[bytes]:
     """Run a short-lived helper (initdb, pg_ctl, the Prisma CLI, rabbitmqctl).
 
@@ -187,17 +255,24 @@ class ChildRegistry:
             entries = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return
+        killed = []
         for entry in entries:
             try:
                 process = psutil.Process(entry["pid"])
                 if abs(process.create_time() - entry["started"]) > 1:
                     continue
+                killed.append(process)
                 logger.warning(f"stopping leftover {entry['name']} (pid {entry['pid']})")
-                for child in process.children(recursive=True):
-                    child.kill()
-                process.kill()
-            except (psutil.Error, KeyError, TypeError):
+                if sys.platform == "win32":
+                    for child in process.children(recursive=True):
+                        child.kill()
+                    process.kill()
+                else:
+                    os.killpg(entry["pid"], signal.SIGKILL)
+            except (psutil.Error, OSError, KeyError, TypeError):
                 continue
+        # Their ports are about to be checked, and reused if they are free.
+        psutil.wait_procs(killed, timeout=10)
         self.path.unlink(missing_ok=True)
 
 

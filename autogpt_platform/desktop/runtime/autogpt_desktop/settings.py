@@ -11,13 +11,13 @@ from __future__ import annotations
 
 import importlib.util
 import json
-import os
 import secrets
+import sys
 from pathlib import Path
 from types import ModuleType
 from urllib.parse import quote
 
-from autogpt_desktop.layout import Bundle, DataDir
+from autogpt_desktop.layout import Bundle, DataDir, write_private
 
 DB_CONNECTION_LIMIT = 5
 FRONTEND_DB_ROLE = "autogpt_frontend"
@@ -37,7 +37,30 @@ GROQ_API_KEY=
 # CHAT_USE_LOCAL=true
 # CHAT_BASE_URL=http://127.0.0.1:11434/v1
 # CHAT_API_KEY=ollama
+# Once you have your account, stop anyone else on this computer creating one:
+# AUTH_ALLOW_NEW_ACCOUNTS=false
 """
+
+# What the Next server is given of the backend's environment: the appliance's
+# list (single-container/run-frontend.sh) without the social sign-in
+# providers. Those send the whole window to the provider and back, and the
+# shell keeps the window on the app (src/navigation.js).
+FRONTEND_PASSTHROUGH = (
+    "AGPT_SERVER_URL",
+    "AGPT_WS_SERVER_URL",
+    "AUTH_ALLOW_NEW_ACCOUNTS",
+    "AUTH_DB_SCHEMA",
+    "AUTH_REQUIRE_EMAIL_VERIFICATION",
+    "AUTH_SIGNUP_ALLOWLIST",
+    "BETTER_AUTH_INTERNAL_URL",
+    "BETTER_AUTH_SECRET",
+    "BETTER_AUTH_URL",
+    "OPENAI_API_BASE_URL",
+    "OPENAI_API_KEY",
+    "TRANSCRIPTION_API_BASE_URL",
+    "TRANSCRIPTION_API_KEY",
+    "TRANSCRIPTION_MODEL",
+)
 
 
 def load_runtime_config_module(bundle: Bundle) -> ModuleType:
@@ -65,7 +88,7 @@ def ensure_secrets(bundle: Bundle, data: DataDir) -> dict[str, str]:
 def read_user_settings(data: DataDir) -> dict[str, str]:
     path = data.config / "settings.env"
     if not path.exists():
-        path.write_text(SETTINGS_TEMPLATE, encoding="utf-8")
+        write_private(path, SETTINGS_TEMPLATE)
     return {key: value for key, value in _read_env(path).items() if value}
 
 
@@ -87,7 +110,7 @@ def backend_environment(
         "APP_ENV": "dev",
         "BEHAVE_AS": "local",
         "ENABLE_AUTH": "true",
-        "AUTH_ALLOW_NEW_ACCOUNTS": "true",
+        "AUTH_ALLOW_NEW_ACCOUNTS": user.get("AUTH_ALLOW_NEW_ACCOUNTS", "true"),
         "AUTH_REQUIRE_EMAIL_VERIFICATION": "false",
         "JWT_VERIFY_KEY": "",
         "SUPABASE_JWT_SECRET": "",
@@ -151,8 +174,14 @@ def backend_environment(
         "PYTHONUTF8": "1",
         "PYTHONIOENCODING": "utf-8",
         "PYTHONPATH": str(bundle.root / "assets" / "python"),
-        "HOME": str(data.home),
         "XDG_CACHE_HOME": str(data.backend_cache),
+        **_home(data.home),
+        # AutoPilot's coding agents keep their sign-in and transcripts under
+        # the home directory. Like the appliance, the app has its own: it
+        # must not pick up, or write into, the user's personal Claude Code or
+        # Codex setup.
+        "CLAUDE_CONFIG_DIR": str(data.home / ".claude"),
+        "CODEX_HOME": str(data.home / ".codex"),
         **_service_addresses(ports),
     }
     return env
@@ -167,32 +196,25 @@ def frontend_environment(
         ports["postgres"],
         None,
     )
-    passthrough = (
-        "AGPT_SERVER_URL",
-        "AGPT_WS_SERVER_URL",
-        "AUTH_ALLOW_NEW_ACCOUNTS",
-        "AUTH_DB_SCHEMA",
-        "AUTH_REQUIRE_EMAIL_VERIFICATION",
-        "BETTER_AUTH_INTERNAL_URL",
-        "BETTER_AUTH_SECRET",
-        "BETTER_AUTH_URL",
-        "AUTH_SIGNUP_ALLOWLIST",
-        "OPENAI_API_KEY",
-        "OPENAI_API_BASE_URL",
-        "TRANSCRIPTION_API_BASE_URL",
-        "TRANSCRIPTION_API_KEY",
-        "TRANSCRIPTION_MODEL",
-    )
     return {
-        **{name: backend[name] for name in passthrough if name in backend},
+        **{name: backend[name] for name in FRONTEND_PASSTHROUGH if name in backend},
         "DATABASE_URL": f"{database}&connection_limit=10",
         "PORT": str(ports["frontend"]),
         "HOSTNAME": "127.0.0.1",
         "NODE_ENV": "production",
         "NEXT_TELEMETRY_DISABLED": "1",
-        "HOME": str(data.frontend_home),
         "XDG_CACHE_HOME": str(data.next_cache),
+        **_home(data.frontend_home),
     }
+
+
+def _home(directory: Path) -> dict[str, str]:
+    """The home directory, as each OS spells it. Python and Node both ignore
+    HOME on Windows and read USERPROFILE."""
+    home = {"HOME": str(directory)}
+    if sys.platform == "win32":
+        home["USERPROFILE"] = str(directory)
+    return home
 
 
 def _service_addresses(ports: dict[str, int]) -> dict[str, str]:
@@ -236,7 +258,7 @@ def _ensure_desktop_secrets(path: Path) -> dict[str, str]:
     missing = [name for name in DESKTOP_SECRETS if not values.get(name)]
     if missing:
         values.update({name: secrets.token_urlsafe(36) for name in missing})
-        _write_private(path, "".join(f"{k}={v}\n" for k, v in values.items()))
+        write_private(path, "".join(f"{k}={v}\n" for k, v in values.items()))
     return values
 
 
@@ -249,12 +271,3 @@ def _read_env(path: Path) -> dict[str, str]:
         name, _, value = line.partition("=")
         values[name.strip()] = value.strip()
     return values
-
-
-def _write_private(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-        stream.write(content)
-    os.replace(temporary, path)

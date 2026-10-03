@@ -3,15 +3,18 @@
 This is the appliance's entrypoint.sh + bootstrap.sh + supervisord, in one
 process:
 
-    config -> postgres -> valkey -> rabbitmq -> migrations -> backend services
-           -> frontend -> proxy -> ready
+    config -> epmd -> postgres | valkey | rabbitmq -> migrations
+           -> backend services | frontend -> proxy -> ready
 
-Stop order is the reverse, and like supervisord's two tiers the stateless
-services go first so the data stores get a quiet, clean shutdown.
+Processes start in tiers; those in a tier do not depend on each other. Tiers
+stop in reverse order, each one all at once. Like supervisord's two stop
+groups, that takes the stateless services away first so the data stores get
+a quiet, clean shutdown.
 """
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import signal
@@ -38,6 +41,8 @@ from autogpt_desktop.process import (
     ChildRegistry,
     ManagedProcess,
     adopt_kill_on_exit_job,
+    base_env,
+    stop_together,
     wait_until,
 )
 from autogpt_desktop.proxy import ProxyThread, Upstreams
@@ -47,6 +52,8 @@ logger = logging.getLogger("autogpt_desktop")
 MAX_RESTARTS = 3
 RESTART_WINDOW_SECONDS = 300
 APP_READY_TIMEOUT_SECONDS = 300
+# What the shell allows a stop before it kills the runtime (src/runtime.js).
+SHELL_STOP_GRACE_SECONDS = 60
 
 
 class StartupError(RuntimeError):
@@ -57,15 +64,26 @@ class Stack:
     def __init__(self, bundle: Bundle, data: DataDir) -> None:
         self.bundle = bundle
         self.data = data
-        self.processes: list[ManagedProcess] = []
+        self.tiers: list[list[ManagedProcess]] = []
         self.proxy: ProxyThread | None = None
         self.registry = ChildRegistry(data.run / "children.json")
         self.restarts: dict[str, list[float]] = {}
         self.stop_requested = threading.Event()
         self.env: dict[str, str] = {}
         self.oneshot: ManagedProcess | None = None
+        self.migrating = False
+
+    @property
+    def processes(self) -> list[ManagedProcess]:
+        return [process for tier in self.tiers for process in tier]
 
     def run(self) -> int:
+        try:
+            return self.run_until_stopped()
+        finally:  # whatever happened, nothing started here is left running
+            self.stop()
+
+    def run_until_stopped(self) -> int:
         try:
             url = self.start()
         except Exception as exc:
@@ -73,13 +91,24 @@ class Stack:
             if not cancelled:
                 logger.exception("startup failed")
                 events.error(str(exc), fatal=True)
-            self.stop()
             return 0 if cancelled else 1
         events.ready(url)
         self.publish_skills_catalog()
-        code = self.watch()
-        self.stop()
-        return code
+        return self.watch()
+
+    def request_stop(self) -> None:
+        """The shell asked for a stop. It kills a runtime that takes too long
+        over one, so say so when this stop has a good reason to be slow."""
+        self.stop_requested.set()
+        if self.migrating:
+            events.stopping(
+                "Finishing a database update before closing",
+                bootstrap.MIGRATION_TIMEOUT_SECONDS + SHELL_STOP_GRACE_SECONDS,
+            )
+
+    def raise_if_cancelled(self) -> None:
+        if self.stop_requested.is_set():
+            raise StartupError("startup was cancelled")
 
     def start(self) -> str:
         bundle, data = self.bundle, self.data
@@ -111,34 +140,54 @@ class Stack:
         )
         rabbit_user = secret["RABBITMQ_DEFAULT_USER"]
         rabbit_password = secret["RABBITMQ_DEFAULT_PASS"]
+        postgres.check_compatible(bundle, data)
         postgres.initialize(bundle, data, secret["POSTGRES_PASSWORD"])
         valkey.write_config(
             data, port["valkey"], port["valkey_bus"], secret["REDIS_PASSWORD"]
         )
         rabbitmq.prepare(data, port["rabbitmq"], rabbit_user, rabbit_password)
 
+        port_mapper = rabbitmq.epmd_process(bundle, data, port)
+        self.launch([port_mapper])
+        self.await_ready(
+            port_mapper, lambda: rabbitmq.epmd_is_ready(port["epmd"]), timeout=30
+        )
+
         database = postgres.process(bundle, data, port["postgres"])
         cache = valkey.process(bundle, data, port["valkey"], secret["REDIS_PASSWORD"])
         queue = rabbitmq.process(bundle, data, port)
-        for process in (database, cache, queue):
-            self.launch(process)
+        self.launch([database, cache, queue])
 
         self.await_ready(
             database,
             lambda: postgres.is_ready(port["postgres"], secret["POSTGRES_PASSWORD"]),
             timeout=120,
         )
-        self.await_ready(
-            cache,
-            lambda: valkey.is_ready(port["valkey"], secret["REDIS_PASSWORD"]),
-            timeout=60,
-        )
+        self.await_cache(cache, port, secret["REDIS_PASSWORD"])
         valkey.ensure_cluster(port["valkey"], secret["REDIS_PASSWORD"])
         self.await_ready(
             queue,
             lambda: rabbitmq.is_ready(port["rabbitmq"], rabbit_user, rabbit_password),
             timeout=240,
         )
+
+    def await_cache(self, cache: ManagedProcess, port: dict[str, int], password: str) -> None:
+        """Valkey exits at once when it cannot read its files (another build
+        wrote them, or they are damaged). They are expendable; start empty."""
+
+        def answers() -> bool:
+            return valkey.is_ready(port["valkey"], password)
+
+        try:
+            self.await_ready(cache, answers, timeout=60)
+        except StartupError:
+            if cache.exit_code() is None or self.stop_requested.is_set():
+                raise
+            valkey.set_aside(self.data)
+            valkey.write_config(self.data, port["valkey"], port["valkey_bus"], password)
+            cache.start()
+            self.record()
+            self.await_ready(cache, answers, timeout=60)
 
     def migrate(
         self, port: dict[str, int], secret: dict[str, str], first_boot: bool
@@ -152,18 +201,30 @@ class Stack:
         connect = self.database_connector(port["postgres"], secret["POSTGRES_PASSWORD"])
         bootstrap.create_schemas(self.bundle, connect)
         bootstrap.refuse_interrupted_migration(connect)
-        bootstrap.apply_migrations(self.bundle, self.env)
+        # A migration that is cut short leaves a database that needs repair by
+        # hand. Once it starts it runs to the end, and a stop request waits.
+        self.migrating = True
+        try:
+            self.raise_if_cancelled()
+            bootstrap.apply_migrations(self.bundle, self.env)
+        finally:
+            self.migrating = False
         bootstrap.configure_frontend_role(
             self.bundle, connect, secret["AUTOGPT_FRONTEND_DB_PASSWORD"]
         )
+        postgres.first_run_completed(self.data)
 
     def start_apps(self, port: dict[str, int], secret: dict[str, str]) -> None:
         bundle, data = self.bundle, self.data
+        self.raise_if_cancelled()
         events.progress("services", "Starting AutoGPT")
-        for service in apps.backend_processes(bundle, data, self.env):
-            self.launch(service)
         frontend_env = settings.frontend_environment(self.env, port, secret, data)
-        self.launch(apps.frontend_process(bundle, data, frontend_env))
+        self.launch(
+            [
+                *apps.backend_processes(bundle, data, self.env),
+                apps.frontend_process(bundle, data, frontend_env),
+            ]
+        )
 
         self.proxy = ProxyThread(
             Upstreams(
@@ -176,12 +237,19 @@ class Stack:
         )
         self.proxy.start()
         self.wait_for_apps(port)
-        self.registry.record(self.processes)
+        self.record()
 
-    def launch(self, process: ManagedProcess) -> None:
-        process.start()
-        self.processes.append(process)
-        self.registry.record(self.processes)
+    def launch(self, tier: list[ManagedProcess]) -> None:
+        started: list[ManagedProcess] = []
+        self.tiers.append(started)
+        for process in tier:
+            process.start()
+            started.append(process)
+            self.record()
+
+    def record(self) -> None:
+        oneshot = [self.oneshot] if self.oneshot else []
+        self.registry.record([*self.processes, *oneshot])
 
     def await_ready(
         self, process: ManagedProcess, probe: Callable[[], bool], timeout: float
@@ -196,8 +264,7 @@ class Stack:
             return probe()
 
         wait_until(settled, timeout)
-        if self.stop_requested.is_set():
-            raise StartupError("startup was cancelled")
+        self.raise_if_cancelled()
         log = self.data.logs / f"{process.name}.log"
         if process.exit_code() is not None:
             raise StartupError(f"{process.name} exited while starting. See {log} for details.")
@@ -225,8 +292,7 @@ class Stack:
 
         if not wait_until(all_healthy, APP_READY_TIMEOUT_SECONDS, interval=1):
             raise StartupError("AutoGPT did not become ready in time")
-        if self.stop_requested.is_set():
-            raise StartupError("startup was cancelled")
+        self.raise_if_cancelled()
 
     def database_connector(self, port: int, password: str):
         import psycopg2
@@ -251,7 +317,7 @@ class Stack:
             argv=apps.entry_point_argv(
                 self.bundle, apps.SKILLS_CATALOG_ENTRY, "--skip-missing-preloads"
             ),
-            env={**apps.base_env(), **self.env},
+            env={**base_env(), **self.env},
             cwd=self.bundle.backend_dir,
             log_dir=self.data.logs,
         )
@@ -261,10 +327,11 @@ class Stack:
             logger.warning(f"could not start the skills catalog publish: {exc}")
             return
         self.oneshot = process
+        self.record()
 
     def watch(self) -> int:
         while not self.stop_requested.wait(2):
-            for index, process in enumerate(self.processes):
+            for process in self.processes:
                 code = process.exit_code()
                 if code is None:
                     continue
@@ -277,8 +344,7 @@ class Stack:
                     return 1
                 logger.warning(f"{process.name} exited with code {code}; restarting it")
                 process.start()
-                self.processes[index] = process
-                self.registry.record(self.processes)
+                self.record()
         return 0
 
     def may_restart(self, name: str) -> bool:
@@ -290,15 +356,14 @@ class Stack:
 
     def stop(self) -> None:
         self.stop_requested.set()
-        if self.oneshot:
-            self.oneshot.stop()
         if self.proxy:
             try:
                 self.proxy.stop()
             except Exception as exc:
                 logger.warning(f"proxy did not stop cleanly: {exc}")
-        for process in reversed(self.processes):
-            process.stop()
+        oneshot = [self.oneshot] if self.oneshot else []
+        for tier in reversed([*self.tiers, oneshot]):
+            stop_together(tier)
         self.registry.path.unlink(missing_ok=True)
 
 
@@ -312,8 +377,9 @@ def serve() -> NoReturn:
     # Skip interpreter finalization: every service is already stopped, and
     # library threads (aiohttp, pika, the stdin watcher) must not be able to
     # turn a clean shutdown into a hang or a crash report.
-    sys.stdout.flush()
-    sys.stderr.flush()
+    with contextlib.suppress(OSError, ValueError):  # the shell may be gone
+        sys.stdout.flush()
+        sys.stderr.flush()
     os._exit(code)
 
 
@@ -342,7 +408,7 @@ def _stop_when_stdin_closes(stack: Stack) -> None:
                 pass
         except OSError:
             pass
-        stack.stop_requested.set()
+        stack.request_stop()
 
     threading.Thread(target=wait_for_eof, name="stdin-watch", daemon=True).start()
 

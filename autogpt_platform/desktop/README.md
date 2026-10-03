@@ -34,13 +34,25 @@ databases or ports. The contract is at the top of `src/runtime.js`.
 | Appliance | Desktop |
 | --- | --- |
 | `runtime_config.py` generates secrets | the same file, shared |
-| supervisord, two stop tiers | `supervisor.py`, reverse start order |
+| supervisord, two stop groups | `supervisor.py`: start tiers, stopped in reverse, each all at once |
 | three Valkey nodes | one node owning all 16384 slots (the backend's `RedisCluster` client cannot tell) |
 | nginx | `proxy.py` (same routes, streamed) |
 | frontend role over a Unix socket | the same role policy, with a generated password over loopback TCP |
-| container exit kills everything | a Job Object on Windows; a recorded-PID sweep elsewhere |
+| container exit kills everything | a Job Object on Windows; process groups and a recorded-PID sweep elsewhere |
+| `/data/home` as the services' home | `home/` in the data directory, so AutoPilot never finds the user's own Claude Code or Codex sign-in |
 | FalkorDB / Graphiti memory | not included (Linux-only module, SSPL) |
 | chat-bot bridge services | not included |
+| sign-in with Google, GitHub, Discord | not included: email and password only |
+
+**Stopping.** Quitting takes about five seconds. The backend services are
+asked to stop together and killed after three seconds, the appliance's own
+finding being that they finish their cleanup in well under one and then wait
+on telemetry teardown. PostgreSQL, Valkey and RabbitMQ are then shut down
+properly. The shell kills a runtime that has not stopped after a minute,
+unless the runtime says it needs longer, which it does for exactly one thing:
+a database migration, which is never interrupted. A first start that is cut
+short anyway (power loss) is detected and redone from scratch on the next
+one, since nobody has used that database yet.
 
 Everything listens on `127.0.0.1` only, including sockets that live for
 microseconds: `build/erlang_patches.py` explains the two places where Erlang
@@ -76,7 +88,15 @@ Fedora 36, or newer).
 
 `config/settings.env` holds provider keys (tray menu → *Settings file*);
 `logs/` has one file per service. Uninstalling the app leaves this directory
-in place.
+in place. It is readable by its owner only.
+
+Anyone who can reach `127.0.0.1` on the machine can create an account until
+`AUTH_ALLOW_NEW_ACCOUNTS=false` is set in `settings.env`; do that once yours
+exists if the computer is shared.
+
+The data belongs to the PostgreSQL major version that created it (18 on
+Windows and macOS, 16 on Linux). A build with a different major refuses to
+start and says why; changing the bundled major needs a migration path first.
 
 ## Building
 
@@ -98,11 +118,18 @@ stopping it leaves no process behind:
 build/runtime/python/bin/python3 build/smoke_test.py build/runtime   # python\python.exe on Windows
 ```
 
-On Windows the bundled Valkey is built separately, inside MSYS2:
+On Windows the bundled Valkey is built separately, inside MSYS2, into
+`build/.cache/valkey-windows`:
 
 ```bash
-bash build/valkey-windows.sh 8.1.10 <output-directory>
+bash build/valkey-windows.sh 8.1.10 build/.cache/valkey-windows
 ```
+
+Without it the build stops. `--redis-stand-in` bundles a Redis build instead,
+for local work only: it is not BSD-licensed, and Valkey cannot read the files
+it writes.
+
+Every download is pinned by SHA-256 in `build/artifacts.py`.
 
 ## Tests
 
@@ -133,10 +160,25 @@ It prints one JSON object per line (`progress`, `ready` with the URL,
   outside Linux.
 - Intel Macs are not supported (a locked dependency ships no x86_64 macOS
   wheel).
-- Not code-signed: Windows SmartScreen and macOS Gatekeeper will warn.
+- Not code-signed. Windows SmartScreen warns (*More info* → *Run anyway*).
+  macOS refuses the first launch; allow it under *System Settings → Privacy
+  & Security → Open Anyway*.
 - No in-place updater yet; installing a newer build over an old one keeps
   the data directory and applies database migrations on first start.
 - The Windows installer takes about ten minutes with Defender's real-time
   scanning on: the bundle is 57,000 files, a third of them bytecode.
-- A few third-party builds are not pinned by checksum yet; the build prints
-  `UNPINNED` with the digest it saw for each.
+- On Windows a service is stopped by ending its process, so an agent run in
+  flight when the app quits is left marked as running. Elsewhere services
+  get three seconds, which a run in flight will not finish in either.
+- There is no admin account: nothing here does what the appliance's
+  `autogpt-admin promote` does.
+- `ffmpeg`, ImageMagick and a browser for AutoPilot's browsing tool are not
+  bundled; the blocks and tools that need them fail without them.
+- Two things are written into the install directory, which the appliance
+  redirects with symlinks and this does not yet: saved admin settings
+  (`backend/config.json`) and the Next image cache. Neither survives an
+  upgrade, and a read-only install (the `.deb`) cannot write them at all.
+- The Memory settings page talks to FalkorDB, which is not there.
+- Do not run it as Administrator on Windows: PostgreSQL refuses to start.
+- A Windows user name longer than 20 characters can push bundled files past
+  the 260-character path limit.
