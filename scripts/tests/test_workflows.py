@@ -102,6 +102,17 @@ def test_the_gate_runs_the_same_tests_as_the_build() -> None:
         assert command in gate and command in unit
 
 
+def test_the_bundle_is_also_run_unwritable_where_installs_are() -> None:
+    build = job(BUILD, "build")
+    names = [step_name(step) for step in steps(build)]
+    first = names.index("Smoke-test the runtime")
+    assert names[first + 1] == "Smoke-test the runtime, read-only"
+    read_only = steps(build)[first + 1]
+    assert "if: runner.os != 'Windows'" in read_only
+    assert "--read-only" in read_only and "build/smoke_test.py build/runtime" in read_only
+    assert "--data-dir" not in read_only, "its temporary data directory is removed"
+
+
 def test_one_unit_job_can_compare_the_commit_with_upstream() -> None:
     """The fork-surface test in the desktop tree skips without an upstream
     ref, so a pull request that edits upstream's files would pass unseen."""

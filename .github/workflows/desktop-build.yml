@@ -622,6 +622,16 @@ jobs:
           --timeout ${{ matrix.smoke_timeout }}
           --data-dir "${RUNNER_TEMP}/autogpt smoke"
 
+      # Once more with every file of the bundle unwritable, which is how a
+      # system-wide install on Linux and a signed app on macOS run: a
+      # service that writes beside its code fails here, not on a user's
+      # machine. One start is enough to see it.
+      - name: Smoke-test the runtime, read-only
+        if: runner.os != 'Windows'
+        run: >-
+          build/runtime/${{ matrix.python }} -B build/smoke_test.py build/runtime
+          --timeout ${{ matrix.smoke_timeout }} --read-only --quick
+
       - name: Free disk for packaging
         run: |
           rm -rf ../frontend/node_modules ../frontend/.next
