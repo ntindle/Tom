@@ -13,12 +13,14 @@ services go first so the data stores get a quiet, clean shutdown.
 from __future__ import annotations
 
 import logging
+import os
 import signal
 import sys
 import threading
 import time
 import urllib.error
 import urllib.request
+from typing import NoReturn
 
 from autogpt_desktop import (
     apps,
@@ -89,11 +91,14 @@ class Stack:
         env = settings.backend_environment(bundle, data, port, secret, user)
         self.env = env
 
-        first_boot = postgres.initialize(bundle, data, secret["POSTGRES_PASSWORD"])
+        first_boot = not postgres.is_initialized(data)
         events.progress(
             "database",
-            "Setting up the database (first start only)" if first_boot else "Starting the database",
+            "Setting up the database (first start only)"
+            if first_boot
+            else "Starting the database",
         )
+        postgres.initialize(bundle, data, secret["POSTGRES_PASSWORD"])
         database = postgres.process(bundle, data, port["postgres"])
         self.launch(database)
         self.require(
@@ -268,13 +273,19 @@ class Stack:
         self.registry.path.unlink(missing_ok=True)
 
 
-def serve() -> int:
+def serve() -> NoReturn:
     events.configure_logging()
     adopt_kill_on_exit_job()
     stack = Stack(Bundle.locate(), DataDir.locate())
     _stop_on_signals(stack)
     _stop_when_stdin_closes(stack)
-    return stack.run()
+    code = stack.run()
+    # Skip interpreter finalization: every service is already stopped, and
+    # library threads (aiohttp, pika, the stdin watcher) must not be able to
+    # turn a clean shutdown into a hang or a crash report.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)
 
 
 def _stop_on_signals(stack: Stack) -> None:
@@ -291,11 +302,16 @@ def _stop_when_stdin_closes(stack: Stack) -> None:
     if sys.stdin is None or sys.stdin.isatty():
         return
 
+    descriptor = sys.stdin.fileno()
+
     def wait_for_eof() -> None:
+        # Read the raw descriptor, not sys.stdin: a thread parked inside the
+        # buffered reader holds its lock, and CPython aborts at exit when it
+        # cannot take that lock back from a daemon thread.
         try:
-            while sys.stdin.buffer.read(4096):
+            while os.read(descriptor, 4096):
                 pass
-        except (OSError, ValueError):
+        except OSError:
             pass
         stack.stop_requested.set()
 

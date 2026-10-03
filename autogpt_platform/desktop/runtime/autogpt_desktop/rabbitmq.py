@@ -9,14 +9,14 @@ Erlang installation on the machine.
 
 from __future__ import annotations
 
+import logging
 import os
 import secrets
-import subprocess
 import sys
 from pathlib import Path
 
 from autogpt_desktop.layout import EXE, Bundle, DataDir
-from autogpt_desktop.process import ManagedProcess, wait_until
+from autogpt_desktop.process import ManagedProcess, run_tool, wait_until
 
 NODE_NAME = "rabbit@localhost"
 WINDOWS = sys.platform == "win32"
@@ -98,6 +98,9 @@ def wait_ready(port: int, user: str, password: str, timeout: float = 240) -> boo
     import pika
     import pika.exceptions
 
+    # pika logs every refused attempt at ERROR; while the broker boots those
+    # are expected and would bury the runtime's own log.
+    logging.getLogger("pika").setLevel(logging.CRITICAL)
     parameters = pika.ConnectionParameters(
         host="127.0.0.1",
         port=port,
@@ -122,22 +125,20 @@ def _stop(bundle: Bundle, env: dict[str, str]) -> None:
     # Erlang leaves its port mapper daemon running after the node exits.
     epmd = next(bundle.erlang_home.glob(f"erts-*/bin/epmd{EXE}"), None)
     if epmd:
-        subprocess.run(
+        run_tool(
             [str(epmd), "-kill"],
             env=env,
             capture_output=True,
             timeout=10,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
 
 
 def _ctl(bundle: Bundle, env: dict[str, str], *args: str) -> None:
-    subprocess.run(
+    run_tool(
         [str(bundle.rabbitmq_script("rabbitmqctl")), "-n", NODE_NAME, *args],
         env=env,
         capture_output=True,
         timeout=25,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
 
 

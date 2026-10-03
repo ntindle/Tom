@@ -148,6 +148,18 @@ def adopt_kill_on_exit_job() -> None:
     _job_handle = job
 
 
+def run_tool(argv: list[str], **kwargs) -> subprocess.CompletedProcess[bytes]:
+    """Run a short-lived helper (initdb, pg_ctl, the Prisma CLI, rabbitmqctl).
+
+    The runtime's stdin is its shutdown channel. A helper that inherited it
+    could block on it forever (the Prisma CLI does) or swallow the EOF the
+    runtime is waiting for, so helpers always get a null stdin.
+    """
+    return subprocess.run(
+        argv, stdin=subprocess.DEVNULL, creationflags=CREATE_NO_WINDOW, **kwargs
+    )
+
+
 class ChildRegistry:
     """Remembers running children on disk so a later boot can clean up after
     a runtime that died without stopping them (POSIX has no Job Objects)."""

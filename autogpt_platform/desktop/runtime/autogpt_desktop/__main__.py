@@ -3,18 +3,17 @@
 from __future__ import annotations
 
 import argparse
-import sys
 
 from autogpt_desktop.supervisor import serve
 
 
-def main() -> int:
+def main() -> None:
     parser = argparse.ArgumentParser(prog="autogpt_desktop")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("serve", help="start AutoGPT and run until stdin closes")
     parser.parse_args()
-    return serve()
+    serve()
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

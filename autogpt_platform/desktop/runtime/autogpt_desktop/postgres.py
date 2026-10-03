@@ -14,22 +14,31 @@ import sys
 from pathlib import Path
 
 from autogpt_desktop.layout import Bundle, DataDir
-from autogpt_desktop.process import ManagedProcess, send_posix_signal, wait_until
+from autogpt_desktop.process import (
+    ManagedProcess,
+    run_tool,
+    send_posix_signal,
+    wait_until,
+)
 
 CONFIG_MARKER = "# autogpt-desktop"
 
 
-def initialize(bundle: Bundle, data: DataDir, password: str) -> bool:
-    """Create the cluster on first boot. Returns True when it was created."""
+def is_initialized(data: DataDir) -> bool:
+    return (data.postgres / "PG_VERSION").is_file()
+
+
+def initialize(bundle: Bundle, data: DataDir, password: str) -> None:
+    """Create the cluster on first boot."""
     pgdata = data.postgres
-    if (pgdata / "PG_VERSION").is_file():
-        return False
+    if is_initialized(data):
+        return
     password_file = data.run / f"postgres-password.{secrets.token_hex(8)}"
     descriptor = os.open(password_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
         stream.write(password + "\n")
     try:
-        subprocess.run(
+        run_tool(
             [
                 str(bundle.postgres_bin("initdb")),
                 f"--pgdata={pgdata}",
@@ -58,7 +67,6 @@ def initialize(bundle: Bundle, data: DataDir, password: str) -> bool:
             "max_connections = 100\n"
             "shared_buffers = 128MB\n"
         )
-    return True
 
 
 def process(bundle: Bundle, data: DataDir, port: int) -> ManagedProcess:
@@ -109,7 +117,7 @@ def _pg_ctl_stop(bundle: Bundle, data: DataDir):
     # Fast shutdown checkpoints and exits; on Windows pg_ctl is also the only
     # way to signal the postmaster, which ignores TerminateProcess etiquette.
     def stop(managed: ManagedProcess) -> None:
-        result = subprocess.run(
+        result = run_tool(
             [
                 str(bundle.postgres_bin("pg_ctl")),
                 "stop",

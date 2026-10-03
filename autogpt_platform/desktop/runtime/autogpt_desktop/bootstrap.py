@@ -11,9 +11,10 @@ privileges.
 from __future__ import annotations
 
 import os
-import subprocess
+from contextlib import closing
 
 from autogpt_desktop.layout import Bundle
+from autogpt_desktop.process import run_tool
 from autogpt_desktop.settings import FRONTEND_DB_ROLE
 
 MIGRATION_TIMEOUT_SECONDS = 900
@@ -25,13 +26,12 @@ class InterruptedMigrationError(RuntimeError):
 
 def create_schemas(bundle: Bundle, connect) -> None:
     sql = bundle.init_sql.read_text(encoding="utf-8")
-    with connect() as connection:
-        connection.autocommit = True
+    with closing(_autocommit(connect)) as connection:
         connection.cursor().execute(sql)
 
 
 def refuse_interrupted_migration(connect) -> None:
-    with connect() as connection:
+    with closing(_autocommit(connect)) as connection:
         cursor = connection.cursor()
         cursor.execute("SELECT to_regclass('platform._prisma_migrations') IS NOT NULL")
         (exists,) = cursor.fetchone()
@@ -60,7 +60,7 @@ def apply_migrations(bundle: Bundle, env: dict[str, str]) -> None:
         "--schema",
         str(bundle.backend_dir / "schema.prisma"),
     ]
-    result = subprocess.run(
+    result = run_tool(
         command,
         cwd=bundle.backend_dir,
         env={
@@ -72,7 +72,6 @@ def apply_migrations(bundle: Bundle, env: dict[str, str]) -> None:
         },
         capture_output=True,
         timeout=MIGRATION_TIMEOUT_SECONDS,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     if result.returncode != 0:
         output = (result.stdout + result.stderr).decode(errors="replace")
@@ -81,12 +80,17 @@ def apply_migrations(bundle: Bundle, env: dict[str, str]) -> None:
 
 def configure_frontend_role(bundle: Bundle, connect, password: str) -> None:
     policy = (bundle.root / "assets" / "frontend-role.sql").read_text(encoding="utf-8")
-    with connect() as connection:
-        connection.autocommit = True
+    with closing(_autocommit(connect)) as connection:
         cursor = connection.cursor()
         cursor.execute(policy)
         # The appliance authenticates this role by Unix-socket peer auth and
         # leaves it passwordless; loopback TCP needs a password instead.
-        cursor.execute(
-            f'ALTER ROLE "{FRONTEND_DB_ROLE}" PASSWORD %s', (password,)
-        )
+        cursor.execute(f'ALTER ROLE "{FRONTEND_DB_ROLE}" PASSWORD %s', (password,))
+
+
+def _autocommit(connect):
+    # Not `with connection:` -- psycopg2 opens a transaction for that block
+    # even in autocommit mode, and the scripts here manage their own.
+    connection = connect()
+    connection.autocommit = True
+    return connection

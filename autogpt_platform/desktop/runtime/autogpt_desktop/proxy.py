@@ -42,6 +42,9 @@ PRIVATE_API = re.compile(
 API_REDIRECT = re.compile(r"^(?:https?://[^/]+)?(/(?:api|external-api)(?:/.*)?)$")
 MAX_BODY = 256 * 1024 * 1024
 
+UPSTREAMS: web.AppKey["Upstreams"] = web.AppKey("upstreams")
+CLIENT: web.AppKey[aiohttp.ClientSession] = web.AppKey("client")
+
 
 @dataclass(frozen=True)
 class Upstreams:
@@ -53,7 +56,7 @@ class Upstreams:
 
 def build_app(upstreams: Upstreams) -> web.Application:
     app = web.Application(client_max_size=MAX_BODY)
-    app["upstreams"] = upstreams
+    app[UPSTREAMS] = upstreams
     app.cleanup_ctx.append(_client_session)
     app.router.add_route("*", "/{tail:.*}", _route)
     return app
@@ -61,13 +64,13 @@ def build_app(upstreams: Upstreams) -> web.Application:
 
 async def _client_session(app: web.Application):
     connector = aiohttp.TCPConnector(limit=0, keepalive_timeout=60)
-    app["client"] = aiohttp.ClientSession(connector=connector, auto_decompress=False)
+    app[CLIENT] = aiohttp.ClientSession(connector=connector, auto_decompress=False)
     yield
-    await app["client"].close()
+    await app[CLIENT].close()
 
 
 async def _route(request: web.Request) -> web.StreamResponse:
-    upstreams: Upstreams = request.app["upstreams"]
+    upstreams = request.app[UPSTREAMS]
     path = request.path
     if path == "/healthz":
         return web.Response(text="ok\n")
@@ -87,8 +90,8 @@ async def _route(request: web.Request) -> web.StreamResponse:
 async def _http(
     request: web.Request, target: str, *, read_timeout: float, api: bool
 ) -> web.StreamResponse:
-    upstreams: Upstreams = request.app["upstreams"]
-    client: aiohttp.ClientSession = request.app["client"]
+    upstreams = request.app[UPSTREAMS]
+    client = request.app[CLIENT]
     try:
         async with client.request(
             request.method,
@@ -119,8 +122,8 @@ async def _http(
 
 
 async def _websocket(request: web.Request, target: str) -> web.StreamResponse:
-    upstreams: Upstreams = request.app["upstreams"]
-    client: aiohttp.ClientSession = request.app["client"]
+    upstreams = request.app[UPSTREAMS]
+    client = request.app[CLIENT]
     protocols = [p.strip() for p in request.headers.get("Sec-WebSocket-Protocol", "").split(",") if p.strip()]
     downstream = web.WebSocketResponse(protocols=protocols, max_msg_size=0, autoping=True)
     await downstream.prepare(request)
@@ -172,9 +175,11 @@ def _rewrite_location(value: str, upstreams: Upstreams, api: bool) -> str:
     if api:
         match = API_REDIRECT.match(value)
         return f"{upstreams.public_url}/_agpt{match.group(1)}" if match else value
-    if value.startswith(upstreams.frontend):
-        return upstreams.public_url + value[len(upstreams.frontend) :]
-    return value
+    # Next builds absolute redirects from its own listen address, and spells
+    # the host either way, so both must be mapped back to the public origin.
+    port = upstreams.frontend.rsplit(":", 1)[1]
+    match = re.match(rf"^https?://(?:localhost|127\.0\.0\.1):{port}(/.*)?$", value)
+    return upstreams.public_url + (match.group(1) or "/") if match else value
 
 
 def _is_websocket(request: web.Request) -> bool:

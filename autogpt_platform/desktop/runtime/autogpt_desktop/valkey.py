@@ -112,8 +112,21 @@ def _client(port: int, password: str):
 
 def _shutdown(port: int, password: str) -> None:
     import redis
+    from redis.backoff import NoBackoff
+    from redis.retry import Retry
 
+    # No retries: the server closes the connection as its reply, and a
+    # retrying client would spend its whole budget reconnecting to a server
+    # that is gone (each refused loopback connect takes ~2s on Windows).
+    client = redis.Redis(
+        host="127.0.0.1",
+        port=port,
+        password=password,
+        socket_timeout=5,
+        socket_connect_timeout=3,
+        retry=Retry(NoBackoff(), 0),
+    )
     try:
-        _client(port, password).shutdown()
-    except redis.ConnectionError:
-        pass  # SHUTDOWN closes the connection by design
+        client.shutdown()
+    except redis.RedisError:
+        pass
