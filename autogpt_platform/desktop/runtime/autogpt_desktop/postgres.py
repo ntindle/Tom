@@ -113,10 +113,15 @@ def initialize(bundle: Bundle, data: DataDir, password: str) -> None:
         )
 
 
-def process(bundle: Bundle, data: DataDir, port: int) -> ManagedProcess:
+def process(
+    bundle: Bundle, data: DataDir, port: int, limits: dict[str, str] | None = None
+) -> ManagedProcess:
     # The port is passed per boot rather than written to postgresql.conf, so a
     # port that ports.py had to move never leaves the config stale. Unix
     # sockets are off: everything connects over loopback TCP on every OS.
+    # `limits` are passed the same way so that they reach installs whose
+    # postgresql.conf was written before they existed.
+    settings = [f"{name}={value}" for name, value in (limits or {}).items()]
     return ManagedProcess(
         name="postgres",
         argv=[
@@ -127,6 +132,7 @@ def process(bundle: Bundle, data: DataDir, port: int) -> ManagedProcess:
             str(port),
             "-c",
             "unix_socket_directories=",
+            *[argument for setting in settings for argument in ("-c", setting)],
         ],
         env=_tool_env(bundle),
         cwd=data.postgres,

@@ -9,7 +9,8 @@ each Linux process replaced by a native one, started and stopped by a small
 supervisor instead of supervisord.
 
 > Experimental. It runs the same code as the appliance, but it has had far
-> less testing, and Windows and macOS builds are not code-signed yet.
+> less testing. Whether a build is signed depends on the release it came
+> from; see [Updates](#updates) and [Signing](#signing).
 
 ## How it fits together
 
@@ -19,7 +20,7 @@ AutoGPT.exe / AutoGPT.app            Electron shell (src/)
        ├─ PostgreSQL + pgvector
        ├─ Valkey (one node, cluster mode)
        ├─ RabbitMQ on a bundled Erlang
-       ├─ 8 AutoGPT backend services
+       ├─ 3 service hosts running the 8 AutoGPT backend services
        ├─ Next.js frontend server
        └─ reverse proxy on 127.0.0.1  the only address the window loads
 ```
@@ -35,6 +36,7 @@ databases or ports. The contract is at the top of `src/runtime.js`.
 | --- | --- |
 | `runtime_config.py` generates secrets | the same file, shared |
 | supervisord, two stop groups | `supervisor.py`: start tiers, stopped in reverse, each all at once |
+| a process per backend service | service hosts: the same eight services in three processes (see [Memory](#memory)) |
 | three Valkey nodes | one node owning all 16384 slots (the backend's `RedisCluster` client cannot tell) |
 | nginx | `proxy.py` (same routes, streamed) |
 | frontend role over a Unix socket | the same role policy, with a generated password over loopback TCP |
@@ -45,15 +47,56 @@ databases or ports. The contract is at the top of `src/runtime.js`.
 | `autogpt-admin promote`, then closing registration by hand | automatic: the first account is the owner and an admin, and registration closes behind it (see [Accounts](#accounts)) |
 | sign-in with Google, GitHub, Discord | email and password only, by decision (see [Accounts](#accounts)) |
 
-**Stopping.** Quitting takes about five seconds. The backend services are
-asked to stop together and killed after three seconds, the appliance's own
-finding being that they finish their cleanup in well under one and then wait
-on telemetry teardown. PostgreSQL, Valkey and RabbitMQ are then shut down
-properly. The shell kills a runtime that has not stopped after a minute,
+**Service hosts.** Every backend service process is a service host
+(`servicehost.py`): it takes upstream's own service objects from upstream's
+own entry points, runs each in a thread exactly as it would run in a process
+of its own, and stops them properly. By default the eight services share
+three hosts, which is what [Memory](#memory) is about. What a host depends on
+upstream is a short list at the top of `servicehost.py`, each item checked
+against the real backend by `runtime/tests/backend_contract.py`. When an
+upstream change breaks one anyway, the host says what changed in its log and
+the supervisor starts a host per service instead, each running its service
+the way upstream's entry point would have: the app costs more memory rather
+than failing to start. That covers the list at the top of `servicehost.py`
+and uvicorn's part in the shared event loop; a change that stops a service
+from running at all is that service's host exiting, and the app says so.
+
+**Ready.** The window opens when what it talks to answers: the REST and
+websocket servers, database-manager behind them, and the frontend. The other
+five services are waited for as well, each on its own port, but where they
+answer is upstream's to move (the executors answer on their metrics ports),
+so they hold the app up for at most 90 seconds more. After that it opens
+anyway and `logs/runtime.log` names the ones that never answered. A host
+that exits while starting ends the wait at once.
+
+A host that loses a service exits and is restarted as a whole (its log,
+`logs/<host>.log`, names the service that ended); a host is restarted at
+most three times in five minutes before the app gives up and says so.
+
+**Stopping.** Quitting takes about five seconds. The service hosts are asked
+to stop together: with SIGTERM, or on Windows, where a signal cannot reach a
+process without a console, through a named event each host waits on. A host
+calls every one of its services' `cleanup()` at once and leaves when they
+are done, which takes about a second; it is killed, with whatever it
+started, if it has not left after three (a run in flight makes the
+executor's cleanup wait, and a quit does not wait for a run). The
+database-manager is stopped after the other services, whose cleanup writes
+through it. PostgreSQL, Valkey and RabbitMQ are then shut down properly. The
+shell kills a runtime that has not stopped after a minute,
 unless the runtime says it needs longer, which it does for exactly one thing:
 a database migration, which is never interrupted. A first start that is cut
 short anyway (power loss) is detected and redone from scratch on the next
 one, since nobody has used that database yet.
+
+**Interrupted agent runs.** An executor locks each run it works on, for five
+minutes at a time, and a new executor that finds the lock of a dead one
+drops the run. Here there is only ever one executor, so those locks are
+cleared before every start of the process that hosts it, on boot and when it
+is restarted after a crash; the run's message is still queued, and the new
+executor picks the run up where it stopped (the step that was interrupted
+runs again). At boot, before any service starts, a run that has been
+"running" for more than 24 hours is marked failed instead of being resumed
+out of the blue days later.
 
 Everything listens on `127.0.0.1` only, including sockets that live for
 microseconds: `build/erlang_patches.py` explains the two places where Erlang
@@ -91,12 +134,74 @@ Fedora 36, or newer). The AppImage also needs FUSE 2 (`libfuse2` on Ubuntu).
 | Linux | `$XDG_DATA_HOME/AutoGPT` (default `~/.local/share/AutoGPT`) |
 
 `config/settings.env` holds provider keys (tray menu → *Settings file*);
-`logs/` has one file per service. Uninstalling the app leaves this directory
-in place. It is readable by its owner only.
+`logs/` has one file per process (`workers.log`, `api.log`,
+`database-manager.log`, `postgres.log`, …). Uninstalling the app leaves this
+directory in place. It is readable by its owner only.
 
 The data belongs to the PostgreSQL major version that created it (18 on
 Windows and macOS, 16 on Linux). A build with a different major refuses to
 start and says why; changing the bundled major needs a migration path first.
+
+## Memory
+
+Each interpreter that imports the backend holds 460–860 MB before it does
+any work (the websocket server the least, database-manager the most), most of it the generated database client and the block library.
+Eight services in eight processes held 5.7 GB of the app's 6.0 GB. They now
+share three:
+
+| Process | Services | Why these together |
+| --- | --- | --- |
+| `database-manager` | database-manager | the others' way to the database; alone |
+| `workers` | executor, copilot-executor, scheduler, batch-executor, notification | none of them connects to the database itself |
+| `api` | websocket, rest | both do, so they serve on one event loop: the database client belongs to the loop that connected it |
+
+The grouping follows one rule of the backend's: whether a query goes
+straight to the database or through database-manager is decided per process,
+so a service that connects cannot share with one that does not. A watchdog
+in the `workers` host ends it if that ever stops being true.
+
+Measured on Windows x64 (31 GB, 24 cores), idle, 45 seconds after ready,
+memory unique to the app's processes (USS):
+
+| Profile | Python processes | Processes in all | Whole app |
+| --- | --- | --- | --- |
+| before: a process per service | 8 | 40+ | 6.0 GB |
+| `balanced`, `compact` | 3 | 36–37 | 3.0 GB |
+| `isolated` | 8 | 48 | 5.9 GB |
+
+The profile is chosen from the machine and reported in `logs/runtime.log`:
+
+| Profile | Chosen when | Layout | Agent runs at once | AutoPilot turns at once |
+| --- | --- | --- | --- | --- |
+| `compact` | 8 GB of memory or less | three service hosts | 4 | 2 |
+| `balanced` | more than 8 GB | three service hosts | one per core, 4 to 10 | one per two cores, 2 to 5 |
+| `isolated` | only when asked for | a host per service | 10 (upstream's default) | 5 |
+
+`AUTOGPT_DESKTOP_PROFILE=isolated` (or `compact`, `balanced`) in
+`config/settings.env` overrides the choice. `isolated` is the layout to fall
+back on, and to compare against, when a merged process misbehaves. The pool
+sizes are threads, so they bound the peak rather than the idle figure;
+`NUM_GRAPH_WORKERS` and `NUM_COPILOT_WORKERS` in `settings.env` win over the
+profile's. PostgreSQL is limited to 50 connections and one autovacuum worker
+on every start; the scheduler's two connection pools are pinned at upstream's
+size of 3 (`SCHEDULER_DB_POOL_SIZE`, also yours to raise in `settings.env`)
+so that the budget behind the 50 does not move when upstream's default does.
+
+A host of five services holds five services' files and sockets under one
+per-process limit, and macOS gives a process started from a terminal 256. On
+macOS and Linux the runtime raises its own soft limit to 8192 (or the hard
+limit, if lower) before it starts anything, and every process inherits it.
+
+The skills catalog is published by one more backend interpreter (about
+700 MB while it runs). It starts a minute after the app is ready rather than
+with it, and not at all when this version of the app has already published
+into this data directory.
+
+What sharing a process costs: a service that crashes takes its host's other
+services down with it for the half minute a restart takes, and the services
+in a host share one Python interpreter lock, so a block that computes for a
+long time can delay the scheduler's tick or an AutoPilot stream (upstream
+runs the batch executor apart from the scheduler for that reason).
 
 ## Accounts
 
@@ -174,6 +279,118 @@ and the URL is `http://127.0.0.1:<public>/auth/integrations/oauth_callback`.
 MCP servers that use OAuth are sent to `/auth/integrations/mcp_callback` on
 the same address; they register it themselves.
 
+## Updates
+
+Releases are GitHub Releases of
+[`ntindle/autogpt`](https://github.com/ntindle/autogpt/releases), tagged
+`desktop-v<version>`. An installed app looks at the latest one a minute after
+it has finished starting, and every six hours after that. It never looks
+while it is starting: a database migration runs then, and an update must not
+land in one. There is one channel; pre-releases are not offered.
+
+If AutoGPT cannot start at all, the app looks once as soon as the start has
+failed, and the window that shows the error offers the newer version next to
+*Show logs*: the release that broke the start is usually fixed by the next
+one, and nobody should have to go and find it.
+
+The app follows the latest release, also after it has downloaded one. If a
+release is withdrawn (an older one is made the latest again) the offer to
+install it goes away at the next look; if a newer one is published, that one
+is downloaded instead.
+
+| | What happens when a newer version exists |
+| --- | --- |
+| Windows | Downloaded in the background. The tray menu and the *Updates* menu (Alt shows the menu bar) then offer **Restart to update to X**. |
+| Linux, AppImage | The same. The AppImage replaces its own file and keeps its name. |
+| macOS, signed build | The same. The app must be in `/Applications` (or anywhere it was moved to by hand), not run from the disk image. |
+| macOS, ad-hoc build | **Version X is available…** in the menus opens the release page; install it by hand. macOS only lets an app replace itself with one signed by the same Developer ID. |
+| Linux, `.deb` | The same link: the package belongs to `apt`, which needs root. |
+
+Nothing is ever installed without **Restart to update**: not when a download
+finishes, not when the app quits. Choosing it looks once more whether that
+version is still the latest release and whether the download is still on
+disk, asks, stops AutoGPT the way *Quit* does (which waits for anything that
+must not be interrupted), installs, and starts the new version. On Windows
+the installer's progress window stays up while it works, which takes minutes.
+What the updater did is in `logs/updater.log`.
+
+When the install does not happen:
+
+- **The download is gone** (a cleaner or antivirus removed it): nothing is
+  stopped; the app downloads it again and offers it again.
+- **The installer cannot be started** and the system says so: the version
+  you have starts again, and the menu links to the download until the app is
+  next started.
+- **Windows, and the installer needs to be run elevated** (the system
+  refused to start it directly; this does not happen with the per-user
+  installer unless something on the machine blocks it): Windows asks for
+  permission, and the app has quit by then. If you say no, nothing was
+  changed and nothing starts by itself: start AutoGPT again, and it offers
+  the update again. electron-updater gives no way to learn the answer.
+
+**What is checked before an update is installed.** The app fetches
+`latest.yml` (`latest-mac.yml`, `latest-linux.yml`) from the latest release
+over HTTPS from `github.com`, and installs the file named there only if its
+SHA-512 is the one in that file. A version lower than the installed one is
+never taken. On top of that:
+
+- **macOS, signed:** the new app must carry a valid signature of the same
+  Developer ID team, or macOS refuses to swap it in.
+- **Windows, signed:** the installer must be signed by the same publisher as
+  the installed app.
+- **Windows, unsigned (every build until there is a certificate):** nothing
+  more. The update is exactly as trustworthy as the GitHub repository and
+  the connection to it: whoever can publish a release there can ship code to
+  every installed copy, and no publisher's signature stands in the way. The
+  same is true of the first download.
+- **Linux AppImage:** nothing more either; AppImages are not signed.
+
+Every release also has a `SHA256SUMS` file and a build-provenance
+attestation, for checking a download by hand:
+`gh attestation verify <file> --repo ntindle/autogpt`.
+
+A build that did not come from a release has the version `0.0.0-dev.<n>`
+(`0.0.1-dev.<n>` for the second build the upgrade test installs) and never
+looks for updates. `AUTOGPT_DESKTOP_UPDATES=off` in the environment switches
+the updater off in any build; the installed-app tests set it.
+
+## Signing
+
+One configuration, `electron-builder.config.js`, builds signed and unsigned
+installers. Which one comes out depends only on the environment the build
+runs in; the release workflow (on the fork's `main` branch, with its manual
+in `docs/MAINTAINING.md` there) sets it from the secrets it has.
+
+| | Without a certificate | With one |
+| --- | --- | --- |
+| Windows | Unsigned. SmartScreen warns: *More info* → *Run anyway*. | Signed (Azure Trusted Signing, or a certificate file). No certificate exists yet. |
+| macOS | Ad-hoc signature: a download counts as intact rather than "damaged", but is not trusted. macOS refuses the first launch until it is allowed under *System Settings → Privacy & Security → Open Anyway*. | Developer ID signature, hardened runtime, notarized by Apple, ticket stapled. Opens like any other downloaded app. |
+| Linux | Not signed. | Not signed. |
+
+A Developer ID build signs every program and library in the app, because
+Apple notarizes nothing less. `build/mac_sign.js` does it and explains the
+rules; the short version:
+
+- The runtime's few thousand Mach-O files are signed one by one, with the
+  hardened runtime. Entitlements are per program and are not inherited by
+  what a program starts, so only the programs that need one get one: the
+  Electron shell and its helpers (JIT, microphone), Python (JIT, executable
+  memory, libraries nobody signed), Node and Erlang's `beam.smp` (JIT),
+  PostgreSQL's programs (`DYLD_FALLBACK_LIBRARY_PATH`). Everything else gets
+  none. The files are in `resources/entitlements.*.plist`.
+- Everything is signed by this build, also files their vendor had signed:
+  under the hardened runtime a program only loads libraries of its own team.
+  The one exception is the Claude Code CLI, Anthropic's signed program, which
+  is shipped byte for byte as Anthropic built it, on macOS and on Windows. If
+  the bundled copy is ever not signed in a way Apple accepts, the build stops
+  instead of signing it.
+- A build that was asked for a Developer ID signature and did not get one
+  (no valid *Developer ID Application* certificate), or was not notarized
+  (no App Store Connect key), fails before any disk image is made.
+  electron-builder would carry on without saying so.
+- `bash build/sign_check_macos.sh <SHA-1>` rehearses all of this on a Mac
+  that has the certificate, on a copy of a built app, without notarizing.
+
 ## Building
 
 Needs `uv`, and `pnpm` (on Windows; elsewhere the build fetches it).
@@ -182,8 +399,13 @@ Needs `uv`, and `pnpm` (on Windows; elsewhere the build fetches it).
 cd autogpt_platform/desktop
 uv run --python 3.13 --no-project build/build_runtime.py   # assembles build/runtime
 npm install
-npx electron-builder --publish never                       # writes dist/
+npx electron-builder --config electron-builder.config.js --publish never   # writes dist/
 ```
+
+That is a development build: version `0.0.0-dev.0`, unsigned on Windows,
+ad-hoc signed on macOS. `AUTOGPT_DESKTOP_VERSION=1.2.3` in the environment
+names a version; the other settings are at the top of
+`electron-builder.config.js`.
 
 `build_runtime.py` is a list of independent steps; `--only frontend,assets`
 re-runs some of them. The frontend must be built on the OS it will run on.
@@ -196,6 +418,17 @@ a restart; a password reset takes effect); `--quick` stops after the first:
 ```bash
 build/runtime/python/bin/python3 build/smoke_test.py build/runtime   # python\python.exe on Windows
 ```
+
+The first start also puts the stack to work. Before it, the bundled backend
+is checked against the service host's contract. While it is up: every
+service answers on its own port; an agent of one calculator block runs to
+the right result; a memory table is printed (per process and in total) and
+held to the profile's budget; the process hosting the executor is killed
+with a run in flight, and must come back, finish that run and take another;
+the skills catalog publish must wait its minute. After each stop, every
+service host's log must show that it was asked, that its services' cleanup
+ran, and that it left by itself. `--profile isolated` runs all of it with a
+process per service.
 
 On Windows the bundled Valkey is built separately, inside MSYS2, into
 `build/.cache/valkey-windows`:
@@ -213,9 +446,23 @@ Every download is pinned by SHA-256 in `build/artifacts.py`.
 ## Tests
 
 ```bash
-node --test "test/*.test.js"                    # shell <-> runtime contract
-cd runtime && python -m pytest                  # config, ports, proxy, owner account
+node --test "test/*.test.js"                    # shell <-> runtime contract, updates, packaging, signing rules
+cd runtime && python -m pytest                  # config, ports, proxy, owner account, service hosts
 ```
+
+The service host is tested against a stand-in backend
+(`runtime/tests/fake_bundle`), so those tests need no backend and run in
+seconds. Two more layers keep the stand-in honest: `test_upstream_names.py`
+reads the names the desktop depends on out of the backend's source, and
+fails with what to update when upstream renames one; and
+`backend_contract.py` imports the real backend, in an interpreter of its
+own, and checks every dependency of the host against it (run by
+`test_backend_contract.py` when `build/runtime` exists, and by the smoke test
+always).
+
+A few of the shell tests read `electron-updater` and `@electron/osx-sign` to
+notice when a new version of either drops something this relies on; they are
+skipped until `npm install` has been run.
 
 The proxy tests cover what nginx did for the appliance: route mapping,
 unbuffered event streams, websockets, redirect rewriting.
@@ -233,26 +480,33 @@ It prints one JSON object per line (`progress`, `ready` with the URL,
 
 ## Known limitations
 
-- About 6 GB of RAM in use: ten Python processes at roughly 600 MB each,
-  because each one imports the whole backend.
+- About 3 GB of RAM in use when idle (see [Memory](#memory)): three Python
+  processes at roughly 850 MB each, because each one imports the whole
+  backend. It was measured on Windows; macOS and Linux have yet to be.
 - AutoPilot's sandboxed shell tool relies on bubblewrap and is unavailable
   outside Linux.
 - Intel Macs are not supported (a locked dependency ships no x86_64 macOS
   wheel).
-- Not signed by a known publisher. Windows SmartScreen warns (*More info* →
-  *Run anyway*). The macOS build has an ad-hoc signature only: enough for a
-  downloaded copy to count as intact rather than "damaged", not enough to
-  be trusted, so macOS refuses the first launch until it is allowed under
-  *System Settings → Privacy & Security → Open Anyway*.
+- No Windows build is signed by a known publisher yet, and a macOS build is
+  only when its release had the certificate (see [Signing](#signing)).
+  Signing, notarization, the release workflow and in-app updates are written
+  and tested as far as they can be without a certificate and a release;
+  none of them has been through a real release yet.
 - On Linux only the runtime inside the packages has been run; the window
   itself has not been opened on a Linux desktop yet.
-- No in-place updater yet; installing a newer build over an old one keeps
-  the data directory and applies database migrations on first start.
+- An update, like installing a newer build over an old one by hand, keeps
+  the data directory and applies database migrations on the next start.
+  There is no way back to an older version once it has: older code does not
+  know the newer database.
+- An update is the whole installer again (700 to 900 MB); only the parts of
+  it that changed are downloaded where the old installer is still cached.
 - The Windows installer takes about ten minutes with Defender's real-time
   scanning on: the bundle is 57,000 files, a third of them bytecode.
-- On Windows a service is stopped by ending its process, so an agent run in
-  flight when the app quits is left marked as running. Elsewhere services
-  get three seconds, which a run in flight will not finish in either.
+- Quitting does not wait for an agent run in flight, and does not ask. The
+  run is interrupted and picked up again at the next start if it began less
+  than 24 hours ago (the interrupted step runs again); an older one is marked
+  failed. There is no "runs are in progress" prompt yet, and no way to stop
+  a run for good as the app closes.
 - `ffmpeg`, ImageMagick and a browser for AutoPilot's browsing tool are not
   bundled; the blocks and tools that need them fail without them.
 - Two things are written into the install directory, which the appliance

@@ -4,7 +4,10 @@ This is the appliance's entrypoint.sh + bootstrap.sh + supervisord, in one
 process:
 
     config -> epmd -> postgres | valkey | rabbitmq -> migrations
-           -> backend services | frontend -> proxy -> ready
+           -> service hosts | frontend -> proxy -> ready
+
+The backend services run in service hosts (servicehost.py), grouped as the
+machine's profile says (resources.py, apps.py).
 
 Processes start in tiers; those in a tier do not depend on each other. Tiers
 stop in reverse order, each one all at once. Like supervisord's two stop
@@ -33,6 +36,9 @@ from autogpt_desktop import (
     ports,
     postgres,
     rabbitmq,
+    resources,
+    runs,
+    servicehost,
     settings,
     valkey,
 )
@@ -41,6 +47,7 @@ from autogpt_desktop.process import (
     ChildRegistry,
     ManagedProcess,
     adopt_kill_on_exit_job,
+    raise_file_limit,
     base_env,
     stop_together,
     wait_until,
@@ -52,6 +59,13 @@ logger = logging.getLogger("autogpt_desktop")
 MAX_RESTARTS = 3
 RESTART_WINDOW_SECONDS = 300
 APP_READY_TIMEOUT_SECONDS = 300
+# Once the window can open: how long the services it does not talk to
+# (apps.NEEDED_TO_OPEN) get to answer before the app is opened without them.
+OTHER_SERVICES_SECONDS = 90
+# The skills catalog is published by one more backend interpreter, 700 MB
+# while it runs. Not while the app is starting and the user first clicks.
+SKILLS_CATALOG_DELAY_SECONDS = 60
+SKILLS_CATALOG_MARKER = "skills-catalog.published"
 # What the shell allows a stop before it kills the runtime (src/runtime.js).
 SHELL_STOP_GRACE_SECONDS = 60
 PASSWORD_RESET_LOST = (
@@ -77,6 +91,13 @@ class Stack:
         self.oneshot: ManagedProcess | None = None
         self.migrating = False
         self.password_reset: str | None = None
+        self.profile = resources.Profile(resources.BALANCED, "not chosen yet", {})
+        self.cache = runs.Cache(0, "")
+        # Process name -> the services it hosts.
+        self.hosts: dict[str, apps.Group] = {}
+        self.ready_at: float | None = None
+        # The bundle version a running publish is for; None once settled.
+        self.publishing: str | None = None
 
     @property
     def processes(self) -> list[ManagedProcess]:
@@ -99,7 +120,7 @@ class Stack:
                 events.error(f"{exc} {lost}".strip(), fatal=True)
             return 0 if cancelled else 1
         events.ready(url)
-        self.publish_skills_catalog()
+        self.ready_at = time.monotonic()
         return self.watch()
 
     def request_stop(self) -> None:
@@ -139,12 +160,19 @@ class Stack:
         self.registry.reap_leftovers()
         secret = settings.ensure_secrets(bundle, data)
         port = ports.allocate(data.ports_file)
+        user = settings.read_user_settings(data)
+        self.profile = resources.choose(user)
+        events.progress("profile", self.profile.describe())
         self.env = settings.backend_environment(
-            bundle, data, port, secret, settings.read_user_settings(data)
+            bundle, data, port, secret, user, self.profile.backend_env
         )
         first_boot = not postgres.is_initialized(data)
         self.start_infrastructure(port, secret, first_boot)
         self.migrate(port, secret, first_boot)
+        runs.reconcile(
+            self.database_connector(port["postgres"], secret["POSTGRES_PASSWORD"]),
+            data.run / runs.STOPPED_RUNS_FILE,
+        )
         self.start_apps(port, secret)
         return self.env["AUTOGPT_PUBLIC_URL"]
 
@@ -175,7 +203,9 @@ class Stack:
             port_mapper, lambda: rabbitmq.epmd_is_ready(port["epmd"]), timeout=30
         )
 
-        database = postgres.process(bundle, data, port["postgres"])
+        database = postgres.process(
+            bundle, data, port["postgres"], resources.POSTGRES_LIMITS
+        )
         cache = valkey.process(bundle, data, port["valkey"], secret["REDIS_PASSWORD"])
         queue = rabbitmq.process(bundle, data, port)
         self.launch([database, cache, queue])
@@ -258,9 +288,16 @@ class Stack:
         self.raise_if_cancelled()
         events.progress("services", "Starting AutoGPT")
         frontend_env = settings.frontend_environment(self.env, port, secret, data)
+        self.cache = runs.Cache(port["valkey"], secret["REDIS_PASSWORD"])
+        groups = apps.layout(self.profile.merged)
+        self.hosts = {group.name: group for group in groups}
+        hosts = apps.backend_processes(bundle, data, self.env, groups, self.cache)
+        # A tier of its own, so that it stops after the services whose way
+        # to the database it is: their cleanup still has things to write.
+        self.launch([host for host in hosts if host.name == apps.DATABASE_MANAGER])
         self.launch(
             [
-                *apps.backend_processes(bundle, data, self.env),
+                *[host for host in hosts if host.name != apps.DATABASE_MANAGER],
                 apps.frontend_process(bundle, data, frontend_env),
             ]
         )
@@ -311,27 +348,81 @@ class Stack:
             raise StartupError(f"{process.name} did not start. See {log} for details.")
 
     def wait_for_apps(self, port: dict[str, int]) -> None:
-        probes = {
-            "rest": f"http://127.0.0.1:{port['agent_api']}/health",
-            "websocket": f"http://127.0.0.1:{port['websocket']}/health",
-            "frontend": f"http://127.0.0.1:{port['frontend']}/",
-        }
-        by_name = {process.name: process for process in self.processes}
+        """The app is ready when what the window talks to answers
+        (apps.NEEDED_TO_OPEN). The other services are expected to answer as
+        well: a host can be running while a service inside it never came up.
+        But where each of them answers is upstream's to change, so they hold
+        the app up only for a while, and then it opens with a warning that
+        names them."""
+        waiting = apps.health_urls(port)
+        usable_since: list[float] = []
 
-        def all_healthy() -> bool:
+        def settled() -> bool:
             if self.stop_requested.is_set():
                 return True
-            for name in probes:
-                if by_name[name].exit_code() is not None:
+            for process in self.applications():
+                if process.exit_code() is not None and not self.isolate(process):
                     raise StartupError(
-                        f"{name} exited while starting. "
-                        f"See {self.data.logs / (name + '.log')} for details."
+                        f"{process.name} exited while starting. "
+                        f"See {self.log_of(process)} for details."
                     )
-            return all(_http_ok(url) for url in probes.values())
+            for name in [name for name, url in waiting.items() if _http_ok(url)]:
+                del waiting[name]
+            if apps.NEEDED_TO_OPEN & waiting.keys():
+                return False
+            if not usable_since:
+                usable_since.append(time.monotonic())
+            return not waiting or time.monotonic() - usable_since[0] >= OTHER_SERVICES_SECONDS
 
-        if not wait_until(all_healthy, APP_READY_TIMEOUT_SECONDS, interval=1):
-            raise StartupError("AutoGPT did not become ready in time")
+        wait_until(settled, APP_READY_TIMEOUT_SECONDS, interval=1)
         self.raise_if_cancelled()
+        if apps.NEEDED_TO_OPEN & waiting.keys():
+            raise StartupError(
+                f"AutoGPT did not become ready in time: no answer from {', '.join(waiting)}"
+            )
+        if waiting:
+            silent = ", ".join(f"{name} (at {port[apps.health_port(name)]})" for name in waiting)
+            logger.warning(
+                f"no answer from {silent} after {OTHER_SERVICES_SECONDS}s; opening the app "
+                "without waiting longer. If their logs show them running, the backend "
+                "changed where they answer: see SERVICES in autogpt_desktop/apps.py."
+            )
+
+    def applications(self) -> list[ManagedProcess]:
+        ours = {*self.hosts, apps.FRONTEND}
+        return [process for process in self.processes if process.name in ours]
+
+    def isolate(self, process: ManagedProcess) -> bool:
+        """A host of several services that exited saying upstream no longer
+        fits it (servicehost.EXIT_CONTRACT) is replaced by a host for each of
+        its services, which can run them the way upstream would. An upstream
+        change costs memory that way, not the app."""
+        group = self.hosts.get(process.name)
+        if process.exit_code() != servicehost.EXIT_CONTRACT or not group or not group.merged:
+            return False
+        logger.warning(
+            f"{process.name} cannot host {', '.join(group.services)} together with this "
+            f"backend (see {self.log_of(process)}); starting a process for each"
+        )
+        # After this it is in no tier, and no stop would reach what it started
+        # (a query engine, once a worker has connected to the database).
+        process.kill()
+        tier = next(tier for tier in self.tiers if process in tier)
+        tier.remove(process)
+        del self.hosts[process.name]
+        groups = apps.isolated((group,))
+        replacements = apps.backend_processes(
+            self.bundle, self.data, self.env, groups, self.cache
+        )
+        for replacement, single in zip(replacements, groups, strict=True):
+            replacement.start()
+            tier.append(replacement)
+            self.hosts[single.name] = single
+            self.record()
+        return True
+
+    def log_of(self, process: ManagedProcess) -> str:
+        return str(self.data.logs / f"{process.name}.log")
 
     def database_connector(self, port: int, password: str):
         import psycopg2
@@ -348,9 +439,31 @@ class Stack:
 
         return connect
 
+    def tend_skills_catalog(self) -> None:
+        """Publish the catalog once the app has been up for a minute, in the
+        background (the appliance blocks boot on it for up to ten minutes,
+        which a desktop user would read as a hang), and only when this
+        bundle has not published it into this data directory before."""
+        if self.oneshot is None:
+            ready_for = time.monotonic() - (self.ready_at or time.monotonic())
+            if ready_for >= SKILLS_CATALOG_DELAY_SECONDS:
+                self.publish_skills_catalog()
+            return
+        code = self.oneshot.exit_code()
+        if code is None or self.publishing is None:
+            return
+        version, self.publishing = self.publishing, None
+        if code != 0:
+            logger.warning(
+                f"the skills catalog was not published (exit code {code}); the next "
+                f"start tries again. See {self.log_of(self.oneshot)}."
+            )
+            return
+        logger.info("published the skills catalog")
+        with contextlib.suppress(OSError):
+            (self.data.config / SKILLS_CATALOG_MARKER).write_text(version, encoding="utf-8")
+
     def publish_skills_catalog(self) -> None:
-        """Best-effort, in the background: the appliance blocks boot on this
-        for up to ten minutes, which a desktop user would read as a hang."""
         process = ManagedProcess(
             name="skills-catalog",
             argv=apps.entry_point_argv(
@@ -360,30 +473,49 @@ class Stack:
             cwd=self.bundle.backend_dir,
             log_dir=self.data.logs,
         )
+        self.oneshot = process  # started or not, this start is done with it
         try:
+            version = apps.bundle_version(self.bundle)
+            if self.published_catalog() == version:
+                logger.info("the skills catalog of this version is already published")
+                return
             process.start()
         except OSError as exc:
             logger.warning(f"could not start the skills catalog publish: {exc}")
             return
-        self.oneshot = process
+        self.publishing = version
         self.record()
+
+    def published_catalog(self) -> str | None:
+        try:
+            return (self.data.config / SKILLS_CATALOG_MARKER).read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
 
     def watch(self) -> int:
         while not self.stop_requested.wait(2):
             for process in self.processes:
                 code = process.exit_code()
-                if code is None:
+                if code is None or self.isolate(process):
                     continue
+                if code == servicehost.EXIT_CONTRACT and process.name in self.hosts:
+                    events.error(
+                        f"{process.name} cannot run with this version of the backend. "
+                        f"See {self.log_of(process)}.",
+                        fatal=True,
+                    )
+                    return 1
                 if not self.may_restart(process.name):
                     events.error(
                         f"{process.name} keeps stopping (exit code {code}). "
-                        f"See {self.data.logs / (process.name + '.log')}.",
+                        f"See {self.log_of(process)}.",
                         fatal=True,
                     )
                     return 1
                 logger.warning(f"{process.name} exited with code {code}; restarting it")
                 process.start()
                 self.record()
+            self.tend_skills_catalog()
         return 0
 
     def may_restart(self, name: str) -> bool:
@@ -409,6 +541,7 @@ class Stack:
 def serve() -> NoReturn:
     events.configure_logging()
     adopt_kill_on_exit_job()
+    raise_file_limit()
     stack = Stack(Bundle.locate(), DataDir.locate())
     _stop_on_signals(stack)
     _stop_when_stdin_closes(stack)

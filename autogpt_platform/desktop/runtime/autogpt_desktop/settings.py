@@ -102,13 +102,17 @@ def backend_environment(
     ports: dict[str, int],
     secret: dict[str, str],
     user: dict[str, str],
+    defaults: dict[str, str] | None = None,
 ) -> dict[str, str]:
+    """`defaults` (the profile's pool sizes) give way to settings.env, which
+    gives way to the runtime's own wiring: later keys win."""
     public_url = f"http://127.0.0.1:{ports['public']}"
     database = _database_url(
         "postgres", secret["POSTGRES_PASSWORD"], ports["postgres"], "platform"
     )
     frontend_origin = f"http://127.0.0.1:{ports['frontend']}"
     env = {
+        **(defaults or {}),
         **user,
         "AUTOGPT_PUBLIC_URL": public_url,
         "APP_ENV": "dev",
