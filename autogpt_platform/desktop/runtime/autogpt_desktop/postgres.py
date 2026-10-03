@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import os
 import secrets
+import signal
 import subprocess
 import sys
-from pathlib import Path
 
 from autogpt_desktop.layout import Bundle, DataDir
 from autogpt_desktop.process import ManagedProcess, run_tool, send_posix_signal
@@ -125,7 +125,7 @@ def _pg_ctl_stop(bundle: Bundle, data: DataDir):
             env=_tool_env(bundle),
         )
         if result.returncode != 0:
-            send_posix_signal(2)(managed)
+            send_posix_signal(signal.SIGINT)(managed)
 
     return stop
 
@@ -144,7 +144,3 @@ def _tool_env(bundle: Bundle) -> dict[str, str]:
         lib = str(bundle.root / "postgres" / "lib")
         env["LD_LIBRARY_PATH"] = lib
     return env
-
-
-def bin_dir(bundle: Bundle) -> Path:
-    return bundle.postgres_bin("postgres").parent

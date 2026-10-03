@@ -42,7 +42,7 @@ PRIVATE_API = re.compile(
 API_REDIRECT = re.compile(r"^(?:https?://[^/]+)?(/(?:api|external-api)(?:/.*)?)$")
 MAX_BODY = 256 * 1024 * 1024
 
-UPSTREAMS: web.AppKey["Upstreams"] = web.AppKey("upstreams")
+UPSTREAMS: web.AppKey[Upstreams] = web.AppKey("upstreams")
 CLIENT: web.AppKey[aiohttp.ClientSession] = web.AppKey("client")
 
 
@@ -117,8 +117,10 @@ async def _http(
                 await response.write(chunk)
             await response.write_eof()
             return response
-    except (aiohttp.ClientConnectionError, asyncio.TimeoutError):
-        raise web.HTTPBadGateway(text="AutoGPT is still starting or a service is down.")
+    except (TimeoutError, aiohttp.ClientConnectionError):
+        raise web.HTTPBadGateway(
+            text="AutoGPT is still starting or a service is down."
+        ) from None
 
 
 async def _websocket(request: web.Request, target: str) -> web.StreamResponse:

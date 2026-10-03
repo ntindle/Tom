@@ -179,11 +179,20 @@ def _short(path: Path) -> str:
     `~/Library/Application Support` on macOS.
     """
     path.mkdir(parents=True, exist_ok=True)
-    if WINDOWS:
+    if sys.platform == "win32":
         return _windows_short_name(path)
     if not any(character.isspace() for character in str(path)):
         return str(path)
-    return str(_symlink_alias(path))
+    # A symlink in a per-user temp directory, whose own path (/tmp, or
+    # /var/folders/... on macOS) has no spaces.
+    root = Path(tempfile.gettempdir()) / f"autogpt-desktop-{os.getuid()}"
+    root.mkdir(mode=0o700, exist_ok=True)
+    link = root / hashlib.sha256(str(path).encode()).hexdigest()[:16]
+    if link.is_symlink() and Path(os.readlink(link)) != path:
+        link.unlink()
+    if not link.is_symlink():
+        link.symlink_to(path, target_is_directory=True)
+    return str(link)
 
 
 def _windows_short_name(path: Path) -> str:
@@ -194,16 +203,3 @@ def _windows_short_name(path: Path) -> str:
     buffer = ctypes.create_unicode_buffer(32768)
     length = ctypes.windll.kernel32.GetShortPathNameW(str(path), buffer, len(buffer))
     return buffer.value if 0 < length < len(buffer) else str(path)
-
-
-def _symlink_alias(path: Path) -> Path:
-    """A symlink to `path` in a per-user temp directory, whose own path
-    (/tmp, or /var/folders/... on macOS) has no spaces."""
-    root = Path(tempfile.gettempdir()) / f"autogpt-desktop-{os.getuid()}"
-    root.mkdir(mode=0o700, exist_ok=True)
-    link = root / hashlib.sha256(str(path).encode()).hexdigest()[:16]
-    if link.is_symlink() and Path(os.readlink(link)) != path:
-        link.unlink()
-    if not link.is_symlink():
-        link.symlink_to(path, target_is_directory=True)
-    return link

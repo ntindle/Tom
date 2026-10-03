@@ -34,7 +34,7 @@ class Bundle:
     root: Path
 
     @classmethod
-    def locate(cls) -> "Bundle":
+    def locate(cls) -> Bundle:
         configured = os.environ.get("AUTOGPT_DESKTOP_RUNTIME")
         root = Path(configured) if configured else Path(__file__).resolve().parents[1]
         return cls(root)
@@ -99,7 +99,7 @@ class DataDir:
     root: Path
 
     @classmethod
-    def locate(cls) -> "DataDir":
+    def locate(cls) -> DataDir:
         configured = os.environ.get("AUTOGPT_DESKTOP_DATA_DIR")
         if not configured:
             raise RuntimeError("AUTOGPT_DESKTOP_DATA_DIR is not set")

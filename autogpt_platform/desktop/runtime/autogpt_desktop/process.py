@@ -17,7 +17,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import signal
 import subprocess
 import sys
 import time
@@ -43,26 +42,26 @@ class ManagedProcess:
     cwd: Path
     log_dir: Path
     # Called to ask the process to exit; terminate() is the fallback.
-    graceful_stop: Callable[["ManagedProcess"], None] | None = None
+    graceful_stop: Callable[[ManagedProcess], None] | None = None
     stop_timeout: float = 10.0
     popen: subprocess.Popen[bytes] | None = field(default=None, repr=False)
 
     def start(self) -> None:
         log_path = self.log_dir / f"{self.name}.log"
         _rotate(log_path)
-        log = open(log_path, "ab", buffering=0)
         logger.info(f"starting {self.name}")
-        self.popen = subprocess.Popen(
-            self.argv,
-            cwd=self.cwd,
-            env=self.env,
-            stdin=subprocess.DEVNULL,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            creationflags=CREATE_NO_WINDOW,
-            start_new_session=not WINDOWS,
-        )
-        log.close()
+        # The child inherits its own handle to the log; ours closes here.
+        with open(log_path, "ab", buffering=0) as log:
+            self.popen = subprocess.Popen(
+                self.argv,
+                cwd=self.cwd,
+                env=self.env,
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                creationflags=CREATE_NO_WINDOW,
+                start_new_session=not WINDOWS,
+            )
 
     @property
     def pid(self) -> int | None:
@@ -205,7 +204,7 @@ class ChildRegistry:
 def send_posix_signal(sig: int) -> Callable[[ManagedProcess], None]:
     def stop(process: ManagedProcess) -> None:
         assert process.popen
-        if WINDOWS:
+        if sys.platform == "win32":
             process.popen.terminate()
         else:
             os.killpg(process.popen.pid, sig)
@@ -229,6 +228,3 @@ def _rotate(path: Path) -> None:
     except FileNotFoundError:
         pass
 
-
-SIGTERM = signal.SIGTERM
-SIGINT = signal.SIGINT
