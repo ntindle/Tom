@@ -16,6 +16,11 @@ PYTHON_VERSION = "3.13.16"
 PYTHON_BUILD = "20261001"
 NODE_VERSION = "24.21.0"
 POSTGRES_BUNDLE = "v0.3.1"  # PostgreSQL 18.6 + pgvector 0.8.6 + pg_trgm
+# Linux builds PostgreSQL from source (see build_runtime.step_postgres). 16 is
+# the newest major whose tarball still ships the generated parser, so the
+# build needs only gcc and make.
+POSTGRES_SOURCE_VERSION = "16.12"
+PGVECTOR_VERSION = "0.8.7"
 ERLANG_VERSION = "27.3.4.18"  # RabbitMQ 4.1 supports Erlang 26.2-27.x
 RABBITMQ_VERSION = "4.1.8"  # matches single-container/Dockerfile
 VALKEY_VERSION = "8.1.10"
@@ -90,7 +95,15 @@ ARTIFACTS: dict[str, dict[str, Artifact]] = {
     "linux-x64": {
         "python": Artifact(_PBS.format(triple="x86_64-unknown-linux-gnu")),
         "node": Artifact(f"{_NODE}/node-v{NODE_VERSION}-linux-x64.tar.gz"),
-        "postgres": Artifact(_POSTGRES.format(target="linux-x64")),
+        # The prebuilt Linux bundle needs glibc 2.38 (Ubuntu 24.04); built
+        # from source here it runs wherever the build machine's glibc does.
+        "postgres": Artifact(
+            "https://ftp.postgresql.org/pub/source/"
+            f"v{POSTGRES_SOURCE_VERSION}/postgresql-{POSTGRES_SOURCE_VERSION}.tar.bz2"
+        ),
+        "pgvector": Artifact(
+            f"https://github.com/pgvector/pgvector/archive/refs/tags/v{PGVECTOR_VERSION}.tar.gz"
+        ),
         "erlang": Artifact(
             f"https://builds.hex.pm/builds/otp/amd64/ubuntu-22.04/OTP-{ERLANG_VERSION}.tar.gz"
         ),

@@ -164,8 +164,50 @@ class Build:
     # --- infrastructure ---------------------------------------------------
 
     def step_postgres(self) -> None:
-        extract(self.fetch("postgres"), self.out / "postgres", strip_top_level=True)
-        shutil.rmtree(self.out / "postgres" / "include", ignore_errors=True)
+        target = self.out / "postgres"
+        if sys.platform.startswith("linux"):
+            self._build_postgres(target)
+        else:
+            extract(self.fetch("postgres"), target, strip_top_level=True)
+        shutil.rmtree(target / "include", ignore_errors=True)
+
+    def _build_postgres(self, target: Path) -> None:
+        """PostgreSQL, pg_trgm and pgvector from source, with no optional
+        libraries: the result depends on glibc alone. The runtime sets
+        LD_LIBRARY_PATH to postgres/lib, and PostgreSQL finds its own share/
+        and lib/ relative to the binary, so the tree can be moved."""
+        jobs = f"-j{os.cpu_count() or 2}"
+        source = self.cache / "postgres-src"
+        extract(self.fetch("postgres"), source, strip_top_level=True)
+        if target.exists():
+            shutil.rmtree(target)
+        run(
+            [
+                "./configure",
+                f"--prefix={target}",
+                "--without-readline",
+                "--without-zlib",
+                "--without-icu",
+            ],
+            cwd=source,
+        )
+        run(["make", jobs], cwd=source)
+        run(["make", "install"], cwd=source)
+        run(["make", "-C", "contrib/pg_trgm", "install"], cwd=source)
+
+        vector = self.cache / "pgvector-src"
+        extract(self.fetch("pgvector"), vector, strip_top_level=True)
+        # OPTFLAGS empty: pgvector defaults to -march=native, which would tie
+        # the binary to the build machine's CPU.
+        pg_config = f"PG_CONFIG={target / 'bin' / 'pg_config'}"
+        run(["make", jobs, pg_config, "OPTFLAGS="], cwd=vector)
+        run(["make", "install", pg_config, "OPTFLAGS="], cwd=vector)
+
+        for unused in ("lib/pgxs", "share/doc", "share/man"):
+            shutil.rmtree(target / unused, ignore_errors=True)
+        binaries = [str(path) for path in (target / "bin").iterdir() if path.is_file()]
+        libraries = [str(path) for path in (target / "lib").glob("*.so*") if not path.is_symlink()]
+        run(["strip", "--strip-unneeded", *binaries, *libraries], check=False)
 
     def step_valkey(self) -> None:
         target = self.out / "valkey"
