@@ -16,7 +16,7 @@ supervisor instead of supervisord.
 ```
 AutoGPT.exe / AutoGPT.app            Electron shell (src/)
   └─ runtime process                  Python supervisor (runtime/autogpt_desktop/)
-       ├─ PostgreSQL 18 + pgvector
+       ├─ PostgreSQL + pgvector
        ├─ Valkey (one node, cluster mode)
        ├─ RabbitMQ on a bundled Erlang
        ├─ 8 AutoGPT backend services
@@ -42,15 +42,29 @@ databases or ports. The contract is at the top of `src/runtime.js`.
 | FalkorDB / Graphiti memory | not included (Linux-only module, SSPL) |
 | chat-bot bridge services | not included |
 
-Everything listens on `127.0.0.1` only. Ports are chosen free on first start
-(from 15000–32000, below every OS's ephemeral range) and remembered, so the
-app's origin stays stable.
+Everything listens on `127.0.0.1` only, including sockets that live for
+microseconds: `build/erlang_patches.py` explains the two places where Erlang
+and RabbitMQ would otherwise touch every interface, which is enough for
+Windows Firewall to prompt on first launch. Ports are chosen free on first
+start (from 15000–32000, below every OS's ephemeral range) and remembered, so
+the app's origin stays stable.
 
 **Bundle.** Nothing is frozen. The bundle is a relocatable CPython with the
 backend's locked dependencies installed, plus upstream builds of everything
 else, pinned in `build/artifacts.py`. Freezing was the 2024 attempt
 (cx_Freeze) and is why Prisma could not find its engine; here the engine path
 is set explicitly, as the appliance does.
+
+| Component | Windows x64 | macOS arm64 | Linux x64 |
+| --- | --- | --- | --- |
+| Python 3.13 | python-build-standalone | same | same |
+| PostgreSQL + pgvector | 18.6, prebuilt | 18.6, prebuilt | 16.12, built from source |
+| Valkey 8.1 | built under MSYS2 | built from source | upstream binary |
+| Erlang 27 + RabbitMQ 4.1 | upstream zips | erlef build + generic-unix | hex.pm build + generic-unix |
+| Node 24, Prisma 5.17 engines | upstream | upstream | upstream |
+
+The Linux bundle needs glibc 2.35 and OpenSSL 3 (Ubuntu 22.04, Debian 12,
+Fedora 36, or newer).
 
 ## Where data lives
 
@@ -77,6 +91,12 @@ npx electron-builder --publish never                       # writes dist/
 
 `build_runtime.py` is a list of independent steps; `--only frontend,assets`
 re-runs some of them. The frontend must be built on the OS it will run on.
+`build/smoke_test.py` boots an assembled bundle, probes it and checks that
+stopping it leaves no process behind:
+
+```bash
+build/runtime/python/bin/python3 build/smoke_test.py build/runtime   # python\python.exe on Windows
+```
 
 On Windows the bundled Valkey is built separately, inside MSYS2:
 
@@ -116,3 +136,7 @@ It prints one JSON object per line (`progress`, `ready` with the URL,
 - Not code-signed: Windows SmartScreen and macOS Gatekeeper will warn.
 - No in-place updater yet; installing a newer build over an old one keeps
   the data directory and applies database migrations on first start.
+- The Windows installer takes about ten minutes with Defender's real-time
+  scanning on: the bundle is 57,000 files, a third of them bytecode.
+- A few third-party builds are not pinned by checksum yet; the build prints
+  `UNPINNED` with the digest it saw for each.
