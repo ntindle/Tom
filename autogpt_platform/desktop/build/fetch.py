@@ -13,9 +13,11 @@ from pathlib import Path
 from artifacts import Artifact
 
 
-def download(artifact: Artifact, cache: Path) -> Path:
+def download(artifact: Artifact, cache: Path, name: str | None = None) -> Path:
+    """Fetch into the cache (as `name`, when the URL's own file name is not
+    unique enough) and verify the pinned digest."""
     cache.mkdir(parents=True, exist_ok=True)
-    target = cache / artifact.filename
+    target = cache / (name or artifact.filename)
     if not target.exists():
         print(f"  downloading {artifact.url}", flush=True)
         partial = target.with_suffix(target.suffix + ".part")

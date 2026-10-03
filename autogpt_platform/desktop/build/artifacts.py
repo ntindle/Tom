@@ -24,6 +24,11 @@ PGVECTOR_VERSION = "0.8.7"
 ERLANG_VERSION = "27.3.4.18"  # RabbitMQ 4.1 supports Erlang 26.2-27.x
 RABBITMQ_VERSION = "4.1.8"  # matches single-container/Dockerfile
 VALKEY_VERSION = "8.1.10"
+# The Claude Code CLI that the locked claude-agent-sdk bundles on macOS and
+# Linux. The SDK publishes no Windows wheel for that version, so the Windows
+# bundle installs the newest SDK that has one (lock_export.PLATFORM_OVERRIDES)
+# and replaces its older CLI with this one. Bump both together with the lock.
+CLAUDE_CLI_VERSION = "2.1.284"
 REDIS_WINDOWS_VERSION = "8.10.2"
 
 
@@ -67,6 +72,12 @@ ARTIFACTS: dict[str, dict[str, Artifact]] = {
             f"OTP-{ERLANG_VERSION}/otp_win64_{ERLANG_VERSION}.zip"
         ),
         "rabbitmq": Artifact(f"{_RABBITMQ}/rabbitmq-server-windows-{RABBITMQ_VERSION}.zip"),
+        # Checksum from the release's own manifest.json.
+        "claude-cli": Artifact(
+            "https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/"
+            f"claude-code-releases/{CLAUDE_CLI_VERSION}/win32-x64/claude.exe",
+            "0416631e846f743110da5282409776fa1313e65f33a588aae066eaf8db0fda7d",
+        ),
         # Valkey publishes no Windows build. Until this project's own MSYS2
         # build of Valkey lands (see build/README.md), the Windows bundle
         # carries the MSYS2 build of Redis from the redis-windows project,

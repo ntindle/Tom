@@ -23,7 +23,7 @@ from pathlib import Path
 import erlang_patches
 import frontend_role_sql
 import lock_export
-from artifacts import ARTIFACTS, platform_key
+from artifacts import ARTIFACTS, CLAUDE_CLI_VERSION, platform_key
 from fetch import download, extract
 
 DESKTOP = Path(__file__).resolve().parents[1]
@@ -99,6 +99,19 @@ class Build:
         uv = ["uv", "pip", "install", "--python", str(self.python), "--break-system-packages"]
         run([*uv, "-r", str(requirements)])
         run([*uv, "--no-deps", str(PLATFORM / "autogpt_libs")])
+        if WINDOWS:
+            self._update_claude_cli()
+
+    def _update_claude_cli(self) -> None:
+        """Give Windows the CLI version the locked SDK ships elsewhere
+        (see artifacts.CLAUDE_CLI_VERSION)."""
+        bundled = self.site_packages / "claude_agent_sdk" / "_bundled" / "claude.exe"
+        if not bundled.is_file():
+            raise RuntimeError(f"claude-agent-sdk no longer bundles its CLI at {bundled}")
+        cli = download(
+            self.artifacts["claude-cli"], self.cache, name=f"claude-{CLAUDE_CLI_VERSION}.exe"
+        )
+        shutil.copy2(cli, bundled)
 
     def step_backend(self) -> None:
         target = self.out / "backend"
