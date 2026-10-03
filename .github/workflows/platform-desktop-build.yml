@@ -1,15 +1,28 @@
-name: AutoGPT Platform - Desktop build (experimental)
+name: AutoGPT Platform - Desktop build
 
-# Builds the desktop distribution (autogpt_platform/desktop) for Windows,
-# macOS and Linux and uploads the installers as workflow artifacts. Nothing is
-# published or signed here.
+# Hands the commit under test to the build on the `main` branch, which holds
+# all of the desktop automation (.github/workflows/desktop-build.yml there).
+# Only what the desktop bundle is assembled from triggers it; the nightly run
+# on `main` covers changes to the backend and the frontend.
 
 on:
-  workflow_dispatch:
+  push:
+    branches: [desktop]
+    paths:
+      - ".github/workflows/platform-desktop-build.yml"
+      - "autogpt_platform/desktop/**"
+      - "autogpt_platform/single-container/runtime_config.py"
+      - "autogpt_platform/single-container/bootstrap.sh"
+      - "autogpt_platform/single-container/python/sitecustomize.py"
+      - "autogpt_platform/db/init/**"
   pull_request:
     paths:
       - ".github/workflows/platform-desktop-build.yml"
       - "autogpt_platform/desktop/**"
+      - "autogpt_platform/single-container/runtime_config.py"
+      - "autogpt_platform/single-container/bootstrap.sh"
+      - "autogpt_platform/single-container/python/sitecustomize.py"
+      - "autogpt_platform/db/init/**"
 
 permissions:
   contents: read
@@ -18,138 +31,10 @@ concurrency:
   group: desktop-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  VALKEY_VERSION: "8.1.10"
-
 jobs:
-  test:
-    name: Shell and runtime tests
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Set up Node
-        uses: actions/setup-node@v6
-        with:
-          node-version: "24"
-
-      - name: Set up uv
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
-
-      - name: Shell tests
-        working-directory: autogpt_platform/desktop
-        run: node --test "test/*.test.js"
-
-      - name: Runtime tests
-        working-directory: autogpt_platform/desktop/runtime
-        run: >-
-          uv run --python 3.13 --no-project
-          --with pytest --with pytest-asyncio --with aiohttp --with redis
-          --with psycopg2-binary --with pika --with psutil --with cryptography
-          python -m pytest -q
-
-  valkey-windows:
-    name: Valkey for Windows
-    runs-on: windows-latest
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Set up MSYS2
-        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2
-        with:
-          msystem: MSYS
-          update: true
-          install: gcc make pkgconf tar
-
-      - name: Build Valkey
-        shell: msys2 {0}
-        run: bash autogpt_platform/desktop/build/valkey-windows.sh "${VALKEY_VERSION}" valkey-windows
-
-      - name: Upload Valkey
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: valkey-windows
-          path: valkey-windows/
-          if-no-files-found: error
-          retention-days: 7
-
-  build:
-    name: ${{ matrix.name }}
-    needs: [test, valkey-windows]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Windows x64
-            os: windows-latest
-            python: python/python.exe
-            artifacts: autogpt_platform/desktop/dist/*.exe
-          - name: macOS arm64
-            os: macos-14
-            python: python/bin/python3
-            artifacts: autogpt_platform/desktop/dist/*.dmg
-          - name: Linux x64
-            os: ubuntu-22.04
-            python: python/bin/python3
-            artifacts: |
-              autogpt_platform/desktop/dist/*.AppImage
-              autogpt_platform/desktop/dist/*.deb
-    defaults:
-      run:
-        working-directory: autogpt_platform/desktop
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Set up Node
-        uses: actions/setup-node@v6
-        with:
-          node-version: "24"
-
-      - name: Set up pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          package_json_file: autogpt_platform/frontend/package.json
-
-      - name: Set up uv
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
-
-      - name: Download Valkey for Windows
-        if: runner.os == 'Windows'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: valkey-windows
-          path: autogpt_platform/desktop/build/.cache/valkey-windows
-
-      - name: Assemble the runtime
-        run: uv run --python 3.13 --no-project build/build_runtime.py
-
-      - name: Smoke-test the runtime
-        shell: bash
-        run: build/runtime/${{ matrix.python }} build/smoke_test.py build/runtime
-
-      - name: Package
-        env:
-          CSC_IDENTITY_AUTO_DISCOVERY: "false"
-        run: |
-          npm install --no-audit --no-fund
-          node node_modules/electron/install.js
-          npx electron-builder --publish never
-
-      - name: Upload installers
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: autogpt-desktop-${{ runner.os }}-${{ runner.arch }}
-          path: ${{ matrix.artifacts }}
-          if-no-files-found: error
-          retention-days: 14
+  desktop:
+    name: Desktop
+    uses: ntindle/autogpt/.github/workflows/desktop-build.yml@main
+    with:
+      ref: ${{ github.sha }}
+      e2e: false
