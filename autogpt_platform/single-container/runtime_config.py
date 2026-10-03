@@ -362,26 +362,35 @@ def _write_config(path: Path, values: dict[str, str]) -> None:
             os.close(descriptor)
             raise
         with stream:
-            os.fchmod(stream.fileno(), 0o600)
+            if hasattr(os, "fchmod"):
+                os.fchmod(stream.fileno(), 0o600)
             stream.write("# Generated once by the AutoGPT all-in-one image.\n")
             for name, value in values.items():
                 stream.write(f"{name}={value}\n")
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
-        directory_flags = os.O_RDONLY
-        if hasattr(os, "O_DIRECTORY"):
-            directory_flags |= os.O_DIRECTORY
-        if hasattr(os, "O_CLOEXEC"):
-            directory_flags |= os.O_CLOEXEC
-        directory_descriptor = os.open(path.parent, directory_flags)
-        try:
-            os.fsync(directory_descriptor)
-        finally:
-            os.close(directory_descriptor)
+        _fsync_directory(path.parent)
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Persist the rename. Windows cannot open a directory as a file and
+    commits the rename with the NTFS journal, so there is nothing to do."""
+    if os.name == "nt":
+        return
+    directory_flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        directory_flags |= os.O_DIRECTORY
+    if hasattr(os, "O_CLOEXEC"):
+        directory_flags |= os.O_CLOEXEC
+    directory_descriptor = os.open(directory, directory_flags)
+    try:
+        os.fsync(directory_descriptor)
+    finally:
+        os.close(directory_descriptor)
 
 
 if __name__ == "__main__":

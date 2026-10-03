@@ -1,0 +1,222 @@
+"""Child processes that cannot outlive the runtime.
+
+Supervisor in the appliance relies on the container dying with PID 1. A
+desktop has no such boundary, so it is rebuilt here:
+
+* Windows: the runtime joins a Job Object with KILL_ON_JOB_CLOSE before it
+  starts anything. Children inherit the job, and Windows kills all of them
+  the moment the runtime's last handle closes, crash or not.
+* POSIX: each child gets its own session (a terminal's Ctrl+C reaches only
+  the runtime, which then stops services in order), and every child's
+  (pid, start time) is recorded so the next boot can kill leftovers from a
+  runtime that was SIGKILLed.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import signal
+import subprocess
+import sys
+import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from pathlib import Path
+
+logger = logging.getLogger("autogpt_desktop")
+
+LOG_ROTATE_BYTES = 20 * 1024 * 1024
+WINDOWS = sys.platform == "win32"
+# Services are background processes; on Windows they must not flash consoles.
+CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+_job_handle: int | None = None
+
+
+@dataclass
+class ManagedProcess:
+    name: str
+    argv: list[str]
+    env: dict[str, str]
+    cwd: Path
+    log_dir: Path
+    # Called to ask the process to exit; terminate() is the fallback.
+    graceful_stop: Callable[["ManagedProcess"], None] | None = None
+    stop_timeout: float = 10.0
+    popen: subprocess.Popen[bytes] | None = field(default=None, repr=False)
+
+    def start(self) -> None:
+        log_path = self.log_dir / f"{self.name}.log"
+        _rotate(log_path)
+        log = open(log_path, "ab", buffering=0)
+        logger.info(f"starting {self.name}")
+        self.popen = subprocess.Popen(
+            self.argv,
+            cwd=self.cwd,
+            env=self.env,
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            creationflags=CREATE_NO_WINDOW,
+            start_new_session=not WINDOWS,
+        )
+        log.close()
+
+    @property
+    def pid(self) -> int | None:
+        return self.popen.pid if self.popen else None
+
+    def exit_code(self) -> int | None:
+        return self.popen.poll() if self.popen else None
+
+    def stop(self) -> None:
+        if not self.popen or self.popen.poll() is not None:
+            return
+        logger.info(f"stopping {self.name}")
+        try:
+            if self.graceful_stop:
+                self.graceful_stop(self)
+            else:
+                self.popen.terminate()
+            self.popen.wait(self.stop_timeout)
+        except Exception as exc:  # the process is going away regardless
+            logger.warning(f"{self.name} did not stop cleanly ({exc}); killing it")
+            self.popen.kill()
+            self.popen.wait(5)
+
+
+def adopt_kill_on_exit_job() -> None:
+    """Windows only: tie every future child to this process's lifetime."""
+    global _job_handle
+    if not WINDOWS or _job_handle is not None:
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    class BasicLimits(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_int64),
+            ("PerJobUserTimeLimit", ctypes.c_int64),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class ExtendedLimits(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", BasicLimits),
+            ("IoInfo", ctypes.c_ulonglong * 6),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel32.CreateJobObjectW.argtypes = (wintypes.LPVOID, wintypes.LPCWSTR)
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.SetInformationJobObject.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    )
+    kernel32.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+    job = kernel32.CreateJobObjectW(None, None)
+    if not job:
+        raise ctypes.WinError(ctypes.get_last_error())
+    limits = ExtendedLimits()
+    limits.BasicLimitInformation.LimitFlags = 0x2000  # KILL_ON_JOB_CLOSE
+    job_object_extended_limit_information = 9
+    if not kernel32.SetInformationJobObject(
+        job,
+        job_object_extended_limit_information,
+        ctypes.byref(limits),
+        ctypes.sizeof(limits),
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    if not kernel32.AssignProcessToJobObject(job, kernel32.GetCurrentProcess()):
+        raise ctypes.WinError(ctypes.get_last_error())
+    _job_handle = job
+
+
+class ChildRegistry:
+    """Remembers running children on disk so a later boot can clean up after
+    a runtime that died without stopping them (POSIX has no Job Objects)."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    def record(self, processes: list[ManagedProcess]) -> None:
+        import psutil
+
+        entries = []
+        for process in processes:
+            if process.pid is None or process.exit_code() is not None:
+                continue
+            try:
+                started = psutil.Process(process.pid).create_time()
+            except psutil.Error:
+                continue
+            entries.append({"name": process.name, "pid": process.pid, "started": started})
+        self.path.write_text(json.dumps(entries), encoding="utf-8")
+
+    def reap_leftovers(self) -> None:
+        import psutil
+
+        try:
+            entries = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        for entry in entries:
+            try:
+                process = psutil.Process(entry["pid"])
+                if abs(process.create_time() - entry["started"]) > 1:
+                    continue
+                logger.warning(f"stopping leftover {entry['name']} (pid {entry['pid']})")
+                for child in process.children(recursive=True):
+                    child.kill()
+                process.kill()
+            except (psutil.Error, KeyError, TypeError):
+                continue
+        self.path.unlink(missing_ok=True)
+
+
+def send_posix_signal(sig: int) -> Callable[[ManagedProcess], None]:
+    def stop(process: ManagedProcess) -> None:
+        assert process.popen
+        if WINDOWS:
+            process.popen.terminate()
+        else:
+            os.killpg(process.popen.pid, sig)
+
+    return stop
+
+
+def wait_until(predicate: Callable[[], bool], timeout: float, interval: float = 0.5) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return predicate()
+
+
+def _rotate(path: Path) -> None:
+    try:
+        if path.stat().st_size > LOG_ROTATE_BYTES:
+            os.replace(path, path.with_suffix(path.suffix + ".1"))
+    except FileNotFoundError:
+        pass
+
+
+SIGTERM = signal.SIGTERM
+SIGINT = signal.SIGINT

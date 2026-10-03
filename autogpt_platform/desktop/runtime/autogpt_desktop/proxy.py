@@ -1,0 +1,226 @@
+"""The public origin, standing in for single-container/nginx/nginx.conf.
+
+Routing is the appliance's:
+
+    /healthz          -> 200
+    /_agpt/ws         -> websocket service /ws          (websocket)
+    /_agpt/docs etc.  -> 404 (API docs and metrics stay private)
+    /_agpt/<path>     -> REST service /<path>            (streamed, unbuffered)
+    everything else   -> Next server
+
+Responses are streamed chunk by chunk so AutoPilot's server-sent events reach
+the browser as they are produced, and bodies are passed through still
+compressed.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import re
+import threading
+from dataclasses import dataclass
+
+import aiohttp
+from aiohttp import web
+
+HOP_BY_HOP = {
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailers",
+    "transfer-encoding",
+    "upgrade",
+    "host",
+    "content-length",
+}
+PRIVATE_API = re.compile(
+    r"^/_agpt/(?:(?:docs|redoc)(?:/|$)|(?:openapi\.json|metrics)/?$"
+    r"|external-api/(?:(?:docs|redoc)(?:/|$)|(?:openapi\.json|metrics)/?$))"
+)
+API_REDIRECT = re.compile(r"^(?:https?://[^/]+)?(/(?:api|external-api)(?:/.*)?)$")
+MAX_BODY = 256 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class Upstreams:
+    public_url: str
+    rest: str
+    websocket: str
+    frontend: str
+
+
+def build_app(upstreams: Upstreams) -> web.Application:
+    app = web.Application(client_max_size=MAX_BODY)
+    app["upstreams"] = upstreams
+    app.cleanup_ctx.append(_client_session)
+    app.router.add_route("*", "/{tail:.*}", _route)
+    return app
+
+
+async def _client_session(app: web.Application):
+    connector = aiohttp.TCPConnector(limit=0, keepalive_timeout=60)
+    app["client"] = aiohttp.ClientSession(connector=connector, auto_decompress=False)
+    yield
+    await app["client"].close()
+
+
+async def _route(request: web.Request) -> web.StreamResponse:
+    upstreams: Upstreams = request.app["upstreams"]
+    path = request.path
+    if path == "/healthz":
+        return web.Response(text="ok\n")
+    if path in ("/_agpt/ws", "/_agpt/ws/"):
+        return await _websocket(request, f"{upstreams.websocket}/ws")
+    if PRIVATE_API.match(path):
+        raise web.HTTPNotFound()
+    if path.startswith("/_agpt/"):
+        target = upstreams.rest + request.rel_url.raw_path_qs[len("/_agpt") :]
+        return await _http(request, target, read_timeout=3600, api=True)
+    target = upstreams.frontend + request.rel_url.raw_path_qs
+    if _is_websocket(request):
+        return await _websocket(request, target.replace("http", "ws", 1))
+    return await _http(request, target, read_timeout=300, api=False)
+
+
+async def _http(
+    request: web.Request, target: str, *, read_timeout: float, api: bool
+) -> web.StreamResponse:
+    upstreams: Upstreams = request.app["upstreams"]
+    client: aiohttp.ClientSession = request.app["client"]
+    try:
+        async with client.request(
+            request.method,
+            target,
+            headers=_forward_headers(request, upstreams),
+            data=request.content if request.body_exists else None,
+            allow_redirects=False,
+            timeout=aiohttp.ClientTimeout(total=None, sock_read=read_timeout),
+        ) as upstream:
+            response = web.StreamResponse(status=upstream.status, reason=upstream.reason)
+            for name, value in upstream.headers.items():
+                if name.lower() in HOP_BY_HOP:
+                    continue
+                if name.lower() == "location":
+                    value = _rewrite_location(value, upstreams, api)
+                response.headers.add(name, value)
+            if api:
+                response.headers["X-Accel-Buffering"] = "no"
+            if upstream.headers.get("Content-Length") and not _is_streaming(upstream):
+                response.content_length = int(upstream.headers["Content-Length"])
+            await response.prepare(request)
+            async for chunk in upstream.content.iter_any():
+                await response.write(chunk)
+            await response.write_eof()
+            return response
+    except (aiohttp.ClientConnectionError, asyncio.TimeoutError):
+        raise web.HTTPBadGateway(text="AutoGPT is still starting or a service is down.")
+
+
+async def _websocket(request: web.Request, target: str) -> web.StreamResponse:
+    upstreams: Upstreams = request.app["upstreams"]
+    client: aiohttp.ClientSession = request.app["client"]
+    protocols = [p.strip() for p in request.headers.get("Sec-WebSocket-Protocol", "").split(",") if p.strip()]
+    downstream = web.WebSocketResponse(protocols=protocols, max_msg_size=0, autoping=True)
+    await downstream.prepare(request)
+    query = request.rel_url.query_string
+    url = f"{target}?{query}" if query and "?" not in target else target
+    headers = {
+        key: value
+        for key, value in _forward_headers(request, upstreams).items()
+        if not key.lower().startswith("sec-websocket")
+    }
+    try:
+        async with client.ws_connect(
+            url, headers=headers, protocols=protocols, max_msg_size=0, heartbeat=None
+        ) as upstream:
+            await asyncio.gather(_pump(downstream, upstream), _pump(upstream, downstream))
+    except aiohttp.ClientError:
+        pass
+    finally:
+        await downstream.close()
+    return downstream
+
+
+async def _pump(source, sink) -> None:
+    async for message in source:
+        if message.type == aiohttp.WSMsgType.TEXT:
+            await sink.send_str(message.data)
+        elif message.type == aiohttp.WSMsgType.BINARY:
+            await sink.send_bytes(message.data)
+        else:
+            break
+    await sink.close()
+
+
+def _forward_headers(request: web.Request, upstreams: Upstreams) -> dict[str, str]:
+    public_host = upstreams.public_url.split("://", 1)[1]
+    headers = {
+        name: value
+        for name, value in request.headers.items()
+        if name.lower() not in HOP_BY_HOP
+    }
+    headers["Host"] = public_host
+    headers["X-Forwarded-For"] = request.remote or "127.0.0.1"
+    headers["X-Forwarded-Proto"] = upstreams.public_url.split("://", 1)[0]
+    headers["X-Forwarded-Host"] = public_host
+    return headers
+
+
+def _rewrite_location(value: str, upstreams: Upstreams, api: bool) -> str:
+    if api:
+        match = API_REDIRECT.match(value)
+        return f"{upstreams.public_url}/_agpt{match.group(1)}" if match else value
+    if value.startswith(upstreams.frontend):
+        return upstreams.public_url + value[len(upstreams.frontend) :]
+    return value
+
+
+def _is_websocket(request: web.Request) -> bool:
+    return request.headers.get("Upgrade", "").lower() == "websocket"
+
+
+def _is_streaming(upstream: aiohttp.ClientResponse) -> bool:
+    return upstream.headers.get("Content-Type", "").startswith("text/event-stream")
+
+
+class ProxyThread:
+    """Runs the proxy on its own event loop so the synchronous supervisor
+    can keep its simple blocking style."""
+
+    def __init__(self, upstreams: Upstreams, port: int) -> None:
+        self.upstreams = upstreams
+        self.port = port
+        self.loop = asyncio.new_event_loop()
+        self.runner: web.AppRunner | None = None
+        self.started = threading.Event()
+        self.failure: BaseException | None = None
+        self.thread = threading.Thread(target=self._run, name="proxy", daemon=True)
+
+    def start(self, timeout: float = 15) -> None:
+        self.thread.start()
+        if not self.started.wait(timeout):
+            raise RuntimeError("the local web server did not start")
+        if self.failure:
+            raise RuntimeError(f"the local web server failed: {self.failure}")
+
+    def stop(self) -> None:
+        if self.runner:
+            asyncio.run_coroutine_threadsafe(self.runner.cleanup(), self.loop).result(10)
+        self.loop.call_soon_threadsafe(self.loop.stop)
+        self.thread.join(10)
+
+    def _run(self) -> None:
+        asyncio.set_event_loop(self.loop)
+        try:
+            self.runner = web.AppRunner(build_app(self.upstreams), access_log=None)
+            self.loop.run_until_complete(self.runner.setup())
+            site = web.TCPSite(self.runner, "127.0.0.1", self.port)
+            self.loop.run_until_complete(site.start())
+        except BaseException as exc:
+            self.failure = exc
+            self.started.set()
+            return
+        self.started.set()
+        self.loop.run_forever()
