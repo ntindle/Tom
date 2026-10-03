@@ -203,7 +203,7 @@ class Build:
             _add_msvc_runtime(target)
             (target / "vc_redist.exe").unlink(missing_ok=True)
         elif sys.platform.startswith("linux"):
-            _make_erlang_relocatable(target)
+            _install_erlang(target)
         for unused in ("doc", "usr/include"):
             shutil.rmtree(target / unused, ignore_errors=True)
 
@@ -459,31 +459,12 @@ def _add_msvc_runtime(erlang: Path) -> None:
             shutil.copy2(system32 / name, bin_dir / name)
 
 
-def _make_erlang_relocatable(erlang: Path) -> None:
-    """The hex.pm Linux build expects `./Install` to write its absolute path
-    into the launcher scripts. Derive the path at run time instead."""
-    relocating = 'ROOTDIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"\n'
-    erts = _single(erlang.glob("erts-*"))
-    for source, target in (
-        (erts / "bin" / "erl.src", erlang / "bin" / "erl"),
-        (erts / "bin" / "erl.src", erts / "bin" / "erl"),
-        (erts / "bin" / "start.src", erlang / "bin" / "start"),
-    ):
-        script = source.read_text(encoding="utf-8")
-        script = script.replace('ROOTDIR="%FINAL_ROOTDIR%"\n', relocating).replace(
-            "%EMU%", "beam"
-        )
-        if target.parent == erts / "bin":
-            script = script.replace(relocating, relocating.replace("/..", "/../.."))
-        target.write_text(script, encoding="utf-8")
-        target.chmod(0o755)
-    for name in ("epmd", "run_erl", "to_erl", "erlc", "escript"):
-        link = erlang / "bin" / name
-        link.unlink(missing_ok=True)
-        link.symlink_to(Path("..") / erts.name / "bin" / name)
-    for boot in ("start.boot", "start_clean.boot", "start_sasl.boot", "no_dot_erlang.boot"):
-        release = _single(erlang.glob(f"releases/*/{boot}"))
-        shutil.copy2(release, erlang / "bin" / boot)
+def _install_erlang(erlang: Path) -> None:
+    """The hex.pm Linux build is an uninstalled release: `Install` creates
+    bin/ and the boot scripts. It records the build path, but the launcher
+    it writes asks `dyn_erl --realpath` where it really is on every start
+    and prefers that, so the tree can be moved afterwards."""
+    run(["./Install", "-sasl", str(erlang)], cwd=erlang)
 
 
 def main() -> int:
