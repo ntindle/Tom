@@ -129,6 +129,29 @@ test("a Developer ID build looks at the packed app before making an installer fr
   await assert.rejects(dmg, /A Developer ID build was asked for, but AutoGPT\.app is not signed/);
 });
 
+test("the configuration loads where nothing has been installed", () => {
+  // The unit tests run before `npm install` on the build machines.
+  const { execFileSync } = require("node:child_process");
+  const bare = `
+    const Module = require("node:module");
+    const resolve = Module._resolveFilename;
+    Module._resolveFilename = function (request, ...rest) {
+      if (!request.startsWith(".") && !request.startsWith("node:") && !require("node:path").isAbsolute(request) && !Module.builtinModules.includes(request)) {
+        throw Object.assign(new Error("Cannot find module '" + request + "'"), { code: "MODULE_NOT_FOUND" });
+      }
+      return resolve.call(this, request, ...rest);
+    };
+    const config = require(process.argv[1]);
+    require("node:fs").writeSync(1, config.appId);
+  `;
+  const appId = execFileSync(process.execPath, ["-e", bare, path.join(DESKTOP, "electron-builder.config.js")], {
+    cwd: DESKTOP,
+    encoding: "utf8",
+    env: { ...process.env, AUTOGPT_DESKTOP_VARIANT: "", AUTOGPT_DESKTOP_MAC_SIGN: "", AUTOGPT_DESKTOP_WIN_SIGN: "" },
+  });
+  assert.equal(appId, "co.agpt.autogpt.desktop");
+});
+
 // What @electron/osx-sign does to every file of the app, in a process that
 // may have fewer files open than the directory holds.
 const OPEN_EVERY_FILE = `
