@@ -105,10 +105,14 @@ test("a Developer ID build is hardened, notarized, and signed by build/mac_sign.
   assert.equal(config.forceCodeSigning, true);
 });
 
+test("only a Developer ID build on a Mac looks at the packed app", (t) => {
+  assert.equal(configured().artifactBuildStarted, undefined);
+  onPlatform(t, "linux");
+  assert.equal(configured({ AUTOGPT_DESKTOP_MAC_SIGN: "developer-id" }).artifactBuildStarted, undefined);
+});
+
 test("a Developer ID build looks at the packed app before making an installer from it", async (t) => {
   // electron-builder ignores forceCodeSigning on macOS when `sign` is a function.
-  assert.equal(configured().artifactBuildStarted, undefined);
-  assert.equal(configured({ AUTOGPT_DESKTOP_MAC_SIGN: "developer-id" }).artifactBuildStarted, undefined);
   onPlatform(t, "darwin");
   const hook = configured({ AUTOGPT_DESKTOP_MAC_SIGN: "developer-id" }).artifactBuildStarted;
   assert.equal(typeof hook, "function");
