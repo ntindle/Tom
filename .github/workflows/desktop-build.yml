@@ -1,0 +1,513 @@
+name: Desktop build
+
+# Builds and tests the desktop app (autogpt_platform/desktop on the `desktop`
+# branch) on clean GitHub-hosted machines. This is the only place that knows
+# how: the `desktop` branch calls it for pull requests and pushes, and
+# desktop-nightly.yml calls it with the installed-app tests switched on.
+#
+# The workflow lives on `main` and the code on `desktop`, so every checkout
+# names the ref it is given. Nothing is signed or published here.
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Branch, tag or commit of this repository to build
+        type: string
+        default: desktop
+      e2e:
+        description: Install the built app on fresh machines and test it
+        type: boolean
+        default: false
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or commit of this repository to build
+        type: string
+        default: desktop
+      e2e:
+        description: Install the built app on fresh machines and test it
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  # The runner is thrown away; a uv cache would only take disk the build needs.
+  UV_NO_CACHE: "1"
+
+jobs:
+  unit:
+    name: Unit tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, macos-15, ubuntu-22.04]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out ${{ inputs.ref }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          enable-cache: false
+
+      - name: Shell tests
+        working-directory: autogpt_platform/desktop
+        run: node --test "test/*.test.js"
+
+      - name: Runtime tests
+        working-directory: autogpt_platform/desktop/runtime
+        run: >-
+          uv run --python 3.13 --no-project
+          --with pytest --with pytest-asyncio --with aiohttp --with redis
+          --with psycopg2-binary --with pika --with psutil --with cryptography
+          python -m pytest -q
+
+  build:
+    name: Build (${{ matrix.name }})
+    needs: unit
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The oldest supported image of each OS: what is built here runs on
+        # that system and everything newer. The e2e job tests the newer ones.
+        include:
+          - name: Windows x64
+            key: windows-x64
+            os: windows-2022
+            python: python/python.exe
+            timeout: 120
+            smoke_timeout: 600
+          - name: macOS arm64
+            key: macos-arm64
+            os: macos-15
+            python: python/bin/python3
+            # 3 cores and 7 GB: the frontend build and a 6 GB stack both swap.
+            timeout: 180
+            smoke_timeout: 900
+          - name: Linux x64
+            key: linux-x64
+            os: ubuntu-22.04
+            python: python/bin/python3
+            timeout: 120
+            smoke_timeout: 600
+    defaults:
+      run:
+        shell: bash
+        working-directory: autogpt_platform/desktop
+    steps:
+      - name: Check out ${{ inputs.ref }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+        with:
+          package_json_file: autogpt_platform/frontend/package.json
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          enable-cache: false
+
+      - name: Target macOS 12 and newer
+        if: runner.os == 'macOS'
+        # Valkey is compiled here; without this it only loads on this image's
+        # own macOS version or newer.
+        run: echo "MACOSX_DEPLOYMENT_TARGET=12.0" >> "$GITHUB_ENV"
+
+      # --- caches: inputs only, never the 2 GB runtime or uv's wheels -------
+
+      - name: Cache pinned downloads
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            autogpt_platform/desktop/build/.cache/*.tar.gz
+            autogpt_platform/desktop/build/.cache/*.tar.bz2
+            autogpt_platform/desktop/build/.cache/*.tar.xz
+            autogpt_platform/desktop/build/.cache/*.zip
+            autogpt_platform/desktop/build/.cache/*.exe
+            autogpt_platform/desktop/build/.cache/otp-*-src
+          key: desktop-downloads-${{ matrix.key }}-${{ hashFiles('autogpt_platform/desktop/build/artifacts.py', 'autogpt_platform/desktop/build/erlang_patches.py') }}
+
+      - name: Locate the pnpm store
+        id: pnpm
+        working-directory: autogpt_platform/frontend
+        run: echo "store=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache the pnpm store
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.pnpm.outputs.store }}
+          key: desktop-pnpm-${{ matrix.key }}-${{ hashFiles('autogpt_platform/frontend/pnpm-lock.yaml') }}
+
+      - name: Cache Electron and electron-builder downloads
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/electron
+            ~/.cache/electron-builder
+            ~/Library/Caches/electron
+            ~/Library/Caches/electron-builder
+            ~/AppData/Local/electron/Cache
+            ~/AppData/Local/electron-builder/Cache
+          key: desktop-electron-${{ matrix.key }}-${{ hashFiles('autogpt_platform/desktop/package-lock.json') }}
+
+      # Not effective yet: build_runtime.py rebuilds PostgreSQL every time.
+      # It starts saving minutes once step_postgres keeps its result in
+      # build/.cache/postgres-built and skips the compile when that is current.
+      - name: Cache the PostgreSQL build
+        if: runner.os == 'Linux'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: autogpt_platform/desktop/build/.cache/postgres-built
+          key: desktop-postgres-${{ matrix.os }}-${{ hashFiles('autogpt_platform/desktop/build/artifacts.py', 'autogpt_platform/desktop/build/build_runtime.py') }}
+
+      # Not effective yet, for the same reason: step_valkey has to keep its
+      # result in build/.cache/valkey-built.
+      - name: Cache the Valkey build
+        if: runner.os == 'macOS'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: autogpt_platform/desktop/build/.cache/valkey-built
+          key: desktop-valkey-${{ matrix.os }}-target12.0-${{ hashFiles('autogpt_platform/desktop/build/artifacts.py', 'autogpt_platform/desktop/build/build_runtime.py') }}
+
+      # --- Valkey for Windows: built under MSYS2, only when the pin moved ---
+
+      - name: Cache Valkey for Windows
+        if: runner.os == 'Windows'
+        id: valkey
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: autogpt_platform/desktop/build/.cache/valkey-windows
+          key: desktop-valkey-windows-${{ hashFiles('autogpt_platform/desktop/build/valkey-windows.sh', 'autogpt_platform/desktop/build/artifacts.py') }}
+
+      - name: Read the Valkey pin
+        if: runner.os == 'Windows' && steps.valkey.outputs.cache-hit != 'true'
+        id: valkey-pin
+        working-directory: autogpt_platform/desktop/build
+        run: |
+          uv run --python 3.13 --no-project python -c "
+          import artifacts
+          print('version=' + artifacts.VALKEY_VERSION)
+          print('sha256=' + artifacts.ARTIFACTS['darwin-arm64']['valkey'].sha256)
+          " | tr -d '\r' >> "$GITHUB_OUTPUT"
+
+      - name: Set up MSYS2
+        if: runner.os == 'Windows' && steps.valkey.outputs.cache-hit != 'true'
+        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2.33.0
+        with:
+          msystem: MSYS
+          # The MSYS2 runtime DLL ships inside the installer: take the one
+          # this action version installs, not whatever is newest today.
+          # The package list is therefore as old as this action version, and
+          # mirrors drop superseded packages. A 404 from pacman in this step
+          # means the list has gone stale: move the SHA above to a newer
+          # setup-msys2 release (Valkey is then rebuilt against its DLL).
+          update: false
+          install: gcc make pkgconf tar
+
+      - name: Build Valkey for Windows
+        if: runner.os == 'Windows' && steps.valkey.outputs.cache-hit != 'true'
+        shell: msys2 {0}
+        env:
+          VALKEY_VERSION: ${{ steps.valkey-pin.outputs.version }}
+          VALKEY_SHA256: ${{ steps.valkey-pin.outputs.sha256 }}
+        run: bash build/valkey-windows.sh "${VALKEY_VERSION}" build/.cache/valkey-windows "${VALKEY_SHA256}"
+
+      # --- assemble, smoke test, package -------------------------------------
+
+      - name: Disk and memory before assembling
+        run: |
+          df -h .
+          case "${RUNNER_OS}" in
+            Linux) free -m ;;
+            macOS) sysctl -n hw.memsize; vm_stat ;;
+            Windows) powershell -NoProfile -Command "Get-CimInstance Win32_OperatingSystem | Format-List TotalVisibleMemorySize,FreePhysicalMemory" ;;
+          esac
+
+      # The frontend's own build script asks for a 16 GB heap, more than the
+      # macOS runner has. That is settled in build_runtime.step_frontend, not
+      # here: NODE_OPTIONS set from this file would be overridden by it.
+      - name: Assemble the runtime
+        run: uv run --python 3.13 --no-project build/build_runtime.py
+
+      - name: Disk and memory after assembling
+        run: |
+          df -h .
+          du -sh build/runtime
+          case "${RUNNER_OS}" in
+            Linux) free -m ;;
+            macOS) vm_stat ;;
+            Windows) powershell -NoProfile -Command "Get-CimInstance Win32_OperatingSystem | Format-List TotalVisibleMemorySize,FreePhysicalMemory" ;;
+          esac
+
+      # A data directory with a space in its path, as macOS always has.
+      # Windows runners are administrators: this passes there only once the
+      # runtime starts PostgreSQL through pg_ctl (postgres.py), which drops
+      # the administrator token that postgres.exe refuses to run with.
+      - name: Smoke-test the runtime
+        run: >-
+          build/runtime/${{ matrix.python }} -B build/smoke_test.py build/runtime
+          --timeout ${{ matrix.smoke_timeout }}
+          --data-dir "${RUNNER_TEMP}/autogpt smoke"
+
+      - name: Free disk for packaging
+        run: |
+          rm -rf ../frontend/node_modules ../frontend/.next
+          df -h .
+
+      - name: Package
+        env:
+          # No certificate here: Windows is unsigned and macOS is ad-hoc
+          # signed (package.json). electron-builder skips every macOS
+          # signature, the ad-hoc one too, on pull requests unless told to.
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+          CSC_FOR_PULL_REQUEST: "true"
+        run: |
+          npm ci --no-audit --no-fund
+          npx electron-builder --publish never
+
+      - name: Verify the macOS signature
+        if: runner.os == 'macOS'
+        run: codesign --verify --deep --strict --verbose=2 dist/mac-arm64/AutoGPT.app
+
+      # Before the second packaging run, so that a failure there does not
+      # lose the installers that are already built and verified.
+      - name: Upload installers
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: installers-${{ matrix.key }}
+          path: |
+            autogpt_platform/desktop/dist/*.exe
+            autogpt_platform/desktop/dist/*.dmg
+            autogpt_platform/desktop/dist/*.AppImage
+            autogpt_platform/desktop/dist/*.deb
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      # What the upgrade test installs over the build above. A full second
+      # packaging run, because the version has to be inside the app as well
+      # as in the installer's name: a same-version .deb is not an upgrade.
+      - name: Package the next version for the upgrade test
+        if: inputs.e2e
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+          CSC_FOR_PULL_REQUEST: "true"
+        run: |
+          next="$(node -p "const [major, minor, patch] = require('./package.json').version.split('-')[0].split('.').map(Number); [major, minor, patch + 1].join('.')")"
+          rm -rf dist/win-unpacked dist/mac-arm64 dist/linux-unpacked
+          npx electron-builder --publish never "-c.extraMetadata.version=${next}" -c.directories.output=dist-upgrade
+          if [ "${RUNNER_OS}" = macOS ]; then
+            codesign --verify --deep --strict --verbose=2 dist-upgrade/mac-arm64/AutoGPT.app
+          fi
+          rm -rf dist-upgrade/win-unpacked dist-upgrade/mac-arm64 dist-upgrade/linux-unpacked
+          df -h .
+
+      - name: Upload the next version's installers
+        if: inputs.e2e
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: installers-${{ matrix.key }}-upgrade
+          path: |
+            autogpt_platform/desktop/dist-upgrade/*.exe
+            autogpt_platform/desktop/dist-upgrade/*.dmg
+            autogpt_platform/desktop/dist-upgrade/*.AppImage
+            autogpt_platform/desktop/dist-upgrade/*.deb
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: build-logs-${{ matrix.key }}
+          path: |
+            ${{ runner.temp }}/autogpt smoke/logs/
+            autogpt_platform/desktop/dist/builder-debug.yml
+            autogpt_platform/desktop/dist-upgrade/builder-debug.yml
+          if-no-files-found: ignore
+          retention-days: 7
+
+  e2e:
+    name: Installed app (${{ matrix.name }})
+    # Not the default, which runs this only when every build leg succeeded:
+    # one OS failing to build must not keep the others from being tested. A
+    # leg whose installers were never uploaded fails at its download step.
+    # `skipped` is the build not having run at all (the unit tests failed).
+    if: ${{ !cancelled() && inputs.e2e && needs.build.result != 'skipped' }}
+    needs: build
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        # Machines that never had the build tools. macOS has 7 GB for a stack
+        # that uses about 6: if it cannot start there, that leg stays red
+        # until the memory work lands. It is not to be hidden.
+        include:
+          - name: Windows Server 2022
+            os: windows-2022
+            installers: windows-x64
+            kind: nsis
+          - name: Windows Server 2025
+            os: windows-2025
+            installers: windows-x64
+            kind: nsis
+          - name: macOS 15
+            os: macos-15
+            installers: macos-arm64
+            kind: dmg
+          - name: macOS 26
+            os: macos-26
+            installers: macos-arm64
+            kind: dmg
+          - name: Ubuntu 22.04 deb
+            os: ubuntu-22.04
+            installers: linux-x64
+            kind: deb
+          - name: Ubuntu 22.04 AppImage
+            os: ubuntu-22.04
+            installers: linux-x64
+            kind: appimage
+          - name: Ubuntu 24.04 deb
+            os: ubuntu-24.04
+            installers: linux-x64
+            kind: deb
+          - name: Ubuntu 24.04 AppImage
+            os: ubuntu-24.04
+            installers: linux-x64
+            kind: appimage
+    defaults:
+      run:
+        shell: bash
+        working-directory: autogpt_platform/desktop/e2e
+    steps:
+      - name: Check out the tests from ${{ inputs.ref }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+          sparse-checkout: autogpt_platform/desktop/e2e
+
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Download installers
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: installers-${{ matrix.installers }}
+          path: ${{ runner.temp }}/installers
+
+      # The second packaging run can fail where the first succeeded. The
+      # other tests still run then; the last step of this job fails it.
+      - name: Download the next version's installers
+        id: upgrade
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: installers-${{ matrix.installers }}-upgrade
+          path: ${{ runner.temp }}/upgrade
+
+      - name: A display and a session bus
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          # xauth is only recommended by xvfb, and xvfb-run needs it.
+          sudo apt-get install -y --no-install-recommends xvfb xauth dbus
+
+      - name: Disk and memory before the tests
+        run: |
+          df -h .
+          case "${RUNNER_OS}" in
+            Linux) free -m ;;
+            macOS) sysctl -n hw.memsize; vm_stat ;;
+            Windows) powershell -NoProfile -Command "Get-CimInstance Win32_OperatingSystem | Format-List TotalVisibleMemorySize,FreePhysicalMemory" ;;
+          esac
+
+      - name: Install the test harness
+        env:
+          # The tests attach to the app's own Chromium; none is downloaded.
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+        run: npm ci --no-audit --no-fund
+
+      - name: Install, run, upgrade and uninstall the app
+        env:
+          AUTOGPT_E2E_KIND: ${{ matrix.kind }}
+          AUTOGPT_E2E_INSTALLER: ${{ runner.temp }}/installers
+          # Empty skips the upgrade test.
+          AUTOGPT_E2E_UPGRADE_INSTALLER: ${{ steps.upgrade.outcome == 'success' && format('{0}/upgrade', runner.temp) || '' }}
+          # Turns on connection auditing and the firewall's notifications on
+          # this throwaway machine so that the firewall check has a log to read.
+          AUTOGPT_E2E_FIREWALL: ${{ runner.os == 'Windows' && '1' || '0' }}
+        run: npx playwright test
+
+      - name: Memory after the tests
+        if: always() && runner.os == 'macOS'
+        run: vm_stat
+
+      # Two uploads, not one: upload-artifact wants one root above every
+      # path, and on Windows the workspace and the home directory are on
+      # different drives.
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-results-${{ matrix.os }}-${{ matrix.kind }}
+          path: |
+            autogpt_platform/desktop/e2e/test-results/
+            autogpt_platform/desktop/e2e/playwright-report/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload the app's logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-logs-${{ matrix.os }}-${{ matrix.kind }}
+          path: |
+            ~/AppData/Local/AutoGPT/logs/
+            ~/Library/Application Support/AutoGPT/logs/
+            ~/.local/share/AutoGPT/logs/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: The upgrade was not tested
+        if: always() && steps.upgrade.outcome == 'failure'
+        run: |
+          echo "::error::No installer of the next version was built, so the upgrade test was skipped."
+          exit 1

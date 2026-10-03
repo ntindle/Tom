@@ -1,0 +1,491 @@
+name: Sync upstream dev into desktop
+
+# Merges Significant-Gravitas/AutoGPT `dev` into this repository's `desktop`
+# branch once a day, but only when the merge is clean and the desktop tests
+# pass on the result. Anything else is reported in ONE issue labelled
+# `upstream-sync`. The operating manual is docs/MAINTAINING.md.
+#
+# This file lives on `main` (the default branch) because scheduled workflows
+# only run from the default branch, and because `desktop` carries all of
+# upstream's workflows, which must not run here.
+#
+# The jobs are split so that the machine which runs upstream's code holds no
+# credential, and the machine which holds the push token runs none of it:
+#
+#   preflight  keep-alive, disable upstream's workflows      actions: write
+#   token      is the push token there, and well guarded?    environment `sync`
+#   merge      what is there to merge, does it conflict?     read-only
+#   gate       the tests, on the merged tree                 read-only, RUNS UPSTREAM CODE
+#   publish    repeat the merge, push, start the build       environment `sync`
+#   report     the upstream-sync issue                       issues: write
+
+on:
+  schedule:
+    - cron: "23 5 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_URL: https://github.com/Significant-Gravitas/AutoGPT.git
+  UPSTREAM_BRANCH: dev
+  PRODUCT_BRANCH: desktop
+  OPS_BRANCH: main
+  BUILD_WORKFLOW: desktop-build.yml
+
+jobs:
+  preflight:
+    name: Keep-alive and workflow check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: write # enable the fork's workflows, disable upstream's
+    steps:
+      - name: Check out the automation (main)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
+        with:
+          ref: ${{ env.OPS_BRANCH }}
+          persist-credentials: false
+
+      # Runs every day, not only after a push: a workflow that upstream added
+      # may only become visible to the API after its first run. --keep-alive
+      # re-enables every workflow on `main`: GitHub switches scheduled
+      # workflows off after 60 days without repository activity, and
+      # re-enabling them needs no commit.
+      - name: Disable upstream's workflows, keep the fork's alive
+        shell: bash
+        timeout-minutes: 5
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/disable_upstream_workflows.py --repo "${GITHUB_REPOSITORY}" --keep-alive
+
+      # This job has no environment, so it sees FORK_SYNC_TOKEN only when the
+      # token is stored as a repository secret. There, any workflow file on
+      # any branch can read it, and `desktop` receives upstream's workflow
+      # files unreviewed.
+      - name: Refuse a token stored as a repository secret
+        shell: bash
+        env:
+          REPOSITORY_SECRET: ${{ secrets.FORK_SYNC_TOKEN != '' }}
+        run: |
+          if [ "${REPOSITORY_SECRET}" = "true" ]; then
+            echo "::error title=Token is exposed::FORK_SYNC_TOKEN is a repository secret. Delete it and store it in the 'sync' environment. See docs/MAINTAINING.md, 'The sync token'."
+            exit 1
+          fi
+
+  token:
+    name: Token check
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: sync
+    permissions:
+      actions: read # read the environment's branch policy
+    outputs:
+      has_token: ${{ steps.token.outputs.present }}
+    steps:
+      - name: Check for the sync token
+        id: token
+        shell: bash
+        env:
+          PRESENT: ${{ secrets.FORK_SYNC_TOKEN != '' }}
+        run: |
+          echo "present=${PRESENT}" >> "${GITHUB_OUTPUT}"
+          if [ "${PRESENT}" != "true" ]; then
+            message="The FORK_SYNC_TOKEN secret is not set in the 'sync' environment, so nothing was synced. See docs/MAINTAINING.md, 'The sync token'."
+            echo "::notice title=Sync skipped::${message}"
+            echo "${message}" >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+      # The environment is what keeps the token away from workflows on
+      # `desktop`, and only while it admits no branch other than `main`.
+      - name: Check that only main may use the environment
+        if: steps.token.outputs.present == 'true'
+        shell: bash
+        timeout-minutes: 2
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          api="repos/${GITHUB_REPOSITORY}/environments/sync"
+          if ! custom="$(gh api "${api}" --jq '.deployment_branch_policy.custom_branch_policies // false')" \
+            || ! allowed="$(gh api "${api}/deployment-branch-policies" --jq '[.branch_policies[] | (.type // "branch") + ":" + .name] | sort | join(",")')"; then
+            echo "::warning title=Environment not checked::Could not read the branch policy of the 'sync' environment."
+            exit 0
+          fi
+          if [ "${custom}" != "true" ] || [ "${allowed}" != "branch:${OPS_BRANCH}" ]; then
+            echo "::error title=Token is exposed::The 'sync' environment must admit the branch '${OPS_BRANCH}' and nothing else (found: '${allowed:-no rule, so every branch}'). See docs/MAINTAINING.md, 'The sync token'."
+            exit 1
+          fi
+
+  merge:
+    name: Merge
+    needs: token
+    if: needs.token.outputs.has_token == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      state: ${{ steps.merge.outputs.state }}
+      upstream_sha: ${{ steps.merge.outputs.upstream_sha }}
+      base_sha: ${{ steps.merge.outputs.base_sha }}
+      tree_sha: ${{ steps.merge.outputs.tree_sha }}
+    steps:
+      - name: Check out the automation (main)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
+        with:
+          ref: ${{ env.OPS_BRANCH }}
+          path: ops
+          persist-credentials: false
+
+      - name: Check out desktop
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 10
+        with:
+          ref: ${{ env.PRODUCT_BRANCH }}
+          path: desktop
+          fetch-depth: 0
+          persist-credentials: false
+
+      # `git merge` runs nothing from the tree it merges. The outputs of this
+      # job are what the later jobs must reproduce.
+      - name: Merge upstream
+        id: merge
+        shell: bash
+        timeout-minutes: 10
+        run: |
+          python3 ops/scripts/merge_upstream.py --repo-dir desktop \
+            --upstream-url "${UPSTREAM_URL}" --upstream-branch "${UPSTREAM_BRANCH}" \
+            --product-branch "${PRODUCT_BRANCH}" --conflicts-file "${RUNNER_TEMP}/conflicts.txt"
+
+      - name: Keep the list of conflicted files
+        if: steps.merge.outputs.state == 'conflict'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        timeout-minutes: 5
+        with:
+          name: sync-conflicts
+          path: ${{ runner.temp }}/conflicts.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  # The only job that runs code from the merged tree, and the packages its
+  # tests install. It gets a token that can only read this public repository,
+  # no secret and no cache, and nothing it produces is trusted: `publish`
+  # repeats the merge from the outputs of `merge`, and `report` reads this
+  # job's logs as text.
+  gate:
+    name: Tests on the merged tree
+    needs: merge
+    if: needs.merge.outputs.state == 'merged'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    outputs:
+      shell: ${{ steps.gate_shell.outcome }}
+      runtime: ${{ steps.gate_runtime.outcome }}
+    steps:
+      - name: Check out the automation (main)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
+        with:
+          ref: ${{ env.OPS_BRANCH }}
+          path: ops
+          persist-credentials: false
+
+      - name: Check out desktop
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 10
+        with:
+          ref: ${{ env.PRODUCT_BRANCH }}
+          path: desktop
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Repeat the merge
+        shell: bash
+        timeout-minutes: 10
+        env:
+          BASE_SHA: ${{ needs.merge.outputs.base_sha }}
+          UPSTREAM_SHA: ${{ needs.merge.outputs.upstream_sha }}
+          TREE_SHA: ${{ needs.merge.outputs.tree_sha }}
+        run: |
+          python3 ops/scripts/merge_upstream.py --repo-dir desktop \
+            --upstream-url "${UPSTREAM_URL}" --upstream-branch "${UPSTREAM_BRANCH}" \
+            --product-branch "${PRODUCT_BRANCH}" \
+            --expect-base "${BASE_SHA}" --expect-upstream "${UPSTREAM_SHA}" --expect-tree "${TREE_SHA}"
+
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        timeout-minutes: 5
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        timeout-minutes: 5
+        with:
+          enable-cache: false
+
+      # The gate. `shell: bash` matters: it turns on pipefail, without which
+      # `tests | tee log` always succeeds and a red merge would be pushed.
+      # Keep both commands identical to the unit job of desktop-build.yml.
+      - name: Gate - shell tests
+        id: gate_shell
+        shell: bash
+        working-directory: desktop/autogpt_platform/desktop
+        timeout-minutes: 10
+        run: node --test "test/*.test.js" 2>&1 | tee "${RUNNER_TEMP}/gate-shell.log"
+
+      - name: Gate - runtime tests
+        id: gate_runtime
+        if: ${{ !cancelled() && steps.gate_shell.outcome != 'skipped' }}
+        shell: bash
+        working-directory: desktop/autogpt_platform/desktop/runtime
+        timeout-minutes: 15
+        run: |
+          uv run --python 3.13 --no-project \
+            --with pytest --with pytest-asyncio --with aiohttp --with redis \
+            --with psycopg2-binary --with pika --with psutil --with cryptography \
+            python -m pytest -q 2>&1 | tee "${RUNNER_TEMP}/gate-runtime.log"
+
+      - name: Keep the test output
+        if: ${{ !cancelled() && (steps.gate_shell.outcome == 'failure' || steps.gate_runtime.outcome == 'failure') }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        timeout-minutes: 5
+        with:
+          name: sync-gate-logs
+          path: |
+            ${{ runner.temp }}/gate-shell.log
+            ${{ runner.temp }}/gate-runtime.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # Starts on a fresh machine and runs nothing from `desktop`. It takes the
+  # commits to merge from `merge`, not from `gate`, and pushes only when the
+  # merge gives the tree the tests ran on.
+  publish:
+    name: Push and start the build
+    needs: [merge, gate]
+    if: needs.merge.outputs.state == 'merged' && needs.gate.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: sync
+    permissions:
+      contents: read # check out both branches; the push uses FORK_SYNC_TOKEN
+      actions: write # disable upstream's workflows, cancel their runs, start the build
+    outputs:
+      build_started: ${{ steps.sweep.outputs.caller_run == 'true' || steps.build.outcome == 'success' }}
+    steps:
+      - name: Check out the automation (main)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
+        with:
+          ref: ${{ env.OPS_BRANCH }}
+          path: ops
+          persist-credentials: false
+
+      - name: Check out desktop
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 10
+        with:
+          ref: ${{ env.PRODUCT_BRANCH }}
+          path: desktop
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Repeat the merge
+        id: merge
+        shell: bash
+        timeout-minutes: 10
+        env:
+          BASE_SHA: ${{ needs.merge.outputs.base_sha }}
+          UPSTREAM_SHA: ${{ needs.merge.outputs.upstream_sha }}
+          TREE_SHA: ${{ needs.merge.outputs.tree_sha }}
+        run: |
+          python3 ops/scripts/merge_upstream.py --repo-dir desktop \
+            --upstream-url "${UPSTREAM_URL}" --upstream-branch "${UPSTREAM_BRANCH}" \
+            --product-branch "${PRODUCT_BRANCH}" \
+            --expect-base "${BASE_SHA}" --expect-upstream "${UPSTREAM_SHA}" --expect-tree "${TREE_SHA}"
+
+      # The token has Workflows write, which GITHUB_TOKEN cannot have and
+      # which almost every upstream merge needs (upstream edits its workflow
+      # files most weeks). It reaches git through the environment, not the
+      # command line, and the push is refused unless it is a fast-forward.
+      - name: Push desktop
+        id: push
+        shell: bash
+        working-directory: desktop
+        timeout-minutes: 5
+        env:
+          FORK_SYNC_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
+          MERGE_SHA: ${{ steps.merge.outputs.merge_sha }}
+        run: |
+          basic="$(printf 'x-access-token:%s' "${FORK_SYNC_TOKEN}" | base64 --wrap=0)"
+          echo "::add-mask::${basic}"
+          export GIT_CONFIG_COUNT=2
+          export GIT_CONFIG_KEY_0="http.https://github.com/.extraheader"
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${basic}"
+          export GIT_CONFIG_KEY_1="core.hooksPath"
+          export GIT_CONFIG_VALUE_1="/dev/null"
+          git push origin "${MERGE_SHA}:refs/heads/${PRODUCT_BRANCH}"
+          echo "Pushed ${MERGE_SHA} to ${PRODUCT_BRANCH}." >> "${GITHUB_STEP_SUMMARY}"
+
+      # A push made with a personal access token starts `on: push` workflows.
+      # One that upstream added in this merge, or one GitHub had not listed
+      # yet, starts once before it can be disabled: cancel that run and
+      # disable the workflow now instead of tomorrow.
+      - name: Disable upstream's workflows and cancel their runs
+        id: sweep
+        shell: bash
+        timeout-minutes: 10
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MERGE_SHA: ${{ steps.merge.outputs.merge_sha }}
+        run: |
+          python3 ops/scripts/disable_upstream_workflows.py --repo "${GITHUB_REPOSITORY}" \
+            --cancel-runs-for-sha "${MERGE_SHA}" --watch-seconds 60
+
+      # The push itself starts the build when the merge touched a file the
+      # caller workflow on `desktop` watches. A second build of the same
+      # commit would only cost runner minutes.
+      - name: Start the installer build
+        id: build
+        if: steps.sweep.outputs.caller_run != 'true'
+        shell: bash
+        timeout-minutes: 2
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run "${BUILD_WORKFLOW}" --repo "${GITHUB_REPOSITORY}" \
+            --ref "${OPS_BRANCH}" -f "ref=${PRODUCT_BRANCH}"
+
+  report:
+    name: Update the sync issue
+    needs: [preflight, token, merge, gate, publish]
+    # always(): a job that hits its timeout is cancelled, and that must be
+    # reported too. Skipped only when the token is known to be missing.
+    if: ${{ always() && needs.token.outputs.has_token != 'false' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write # the upstream-sync issue and its label
+      actions: write # start a build that an earlier run could not start
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      UPSTREAM_SHA: ${{ needs.merge.outputs.upstream_sha }}
+    steps:
+      # Files written by other jobs, one of which ran upstream's code. They
+      # are only ever quoted in the issue as text. Downloaded before the
+      # checkout so that nothing in them can end up in the scripts.
+      - name: Fetch conflict list and test output
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true
+        timeout-minutes: 5
+        with:
+          pattern: sync-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/sync
+
+      - name: Check out the automation (main)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
+        with:
+          ref: ${{ env.OPS_BRANCH }}
+          path: ops
+          persist-credentials: false
+
+      # Asked of GitHub, not of the publish job: a job that failed half-way
+      # cannot be relied on to say how far it got. The merge this run pushes
+      # has exactly these two parents.
+      - name: Was desktop pushed?
+        id: pushed
+        if: needs.publish.result == 'failure' || needs.publish.result == 'cancelled'
+        shell: bash
+        timeout-minutes: 2
+        env:
+          BASE_SHA: ${{ needs.merge.outputs.base_sha }}
+        run: |
+          parents="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${PRODUCT_BRANCH}" --jq '[.parents[].sha] | join(",")')"
+          if [ "${parents}" = "${BASE_SHA},${UPSTREAM_SHA}" ]; then
+            echo "pushed=true" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Does an earlier push still wait for its build?
+        id: pending
+        shell: bash
+        timeout-minutes: 2
+        run: python3 ops/scripts/sync_issue.py --repo "${GITHUB_REPOSITORY}" pending-build
+
+      # Without this, a push whose build could not be started would be
+      # forgotten: the next run finds `desktop` up to date and has no reason
+      # to build.
+      - name: Start the build that is still owed
+        id: catchup
+        if: ${{ (steps.pending.outputs.pending == 'true' || steps.pushed.outputs.pushed == 'true') && needs.publish.outputs.build_started != 'true' }}
+        shell: bash
+        timeout-minutes: 2
+        run: |
+          gh workflow run "${BUILD_WORKFLOW}" --repo "${GITHUB_REPOSITORY}" \
+            --ref "${OPS_BRANCH}" -f "ref=${PRODUCT_BRANCH}"
+
+      - name: Update the issue
+        if: always()
+        shell: bash
+        timeout-minutes: 5
+        env:
+          PREFLIGHT: ${{ needs.preflight.result }}
+          TOKEN: ${{ needs.token.result }}
+          MERGE: ${{ needs.merge.result }}
+          GATE: ${{ needs.gate.result }}
+          PUBLISH: ${{ needs.publish.result }}
+          MERGE_STATE: ${{ needs.merge.outputs.state }}
+          GATE_SHELL: ${{ needs.gate.outputs.shell }}
+          GATE_RUNTIME: ${{ needs.gate.outputs.runtime }}
+          BUILD_STARTED: ${{ needs.publish.outputs.build_started }}
+          PUSHED_CHECK: ${{ steps.pushed.outcome }}
+          PUSHED: ${{ steps.pushed.outputs.pushed }}
+          PENDING_CHECK: ${{ steps.pending.outcome }}
+          CATCHUP: ${{ steps.catchup.outcome }}
+        run: |
+          kind="$(python3 ops/scripts/sync_issue.py classify --merge-state "${MERGE_STATE}" \
+            --result "preflight=${PREFLIGHT}" --result "token=${TOKEN}" --result "merge=${MERGE}" \
+            --result "gate=${GATE}" --result "gate_shell=${GATE_SHELL}" --result "gate_runtime=${GATE_RUNTIME}" \
+            --result "publish=${PUBLISH}" --result "pushed_check=${PUSHED_CHECK}" \
+            --result "pending_check=${PENDING_CHECK}" --result "catchup=${CATCHUP}")"
+
+          if [ "${kind}" = "ok" ]; then
+            if [ "${MERGE_STATE}" = "merged" ]; then
+              message="Fixed: \`${PRODUCT_BRANCH}\` contains upstream \`${UPSTREAM_SHA:0:10}\` and the tests pass. Run: ${RUN_URL}"
+            else
+              message="\`${PRODUCT_BRANCH}\` already contains upstream \`${UPSTREAM_SHA:0:10}\`. This run did not merge anything and did not run the tests. Run: ${RUN_URL}"
+            fi
+            python3 ops/scripts/sync_issue.py --repo "${GITHUB_REPOSITORY}" resolve \
+              --kinds conflict,gate,error --message "${message}"
+            exit 0
+          fi
+
+          arguments=(--kind "${kind}" --upstream-sha "${UPSTREAM_SHA}" --run-url "${RUN_URL}")
+          if [ "${PUSHED}" = "true" ]; then arguments+=(--pushed); fi
+          if [ "${BUILD_STARTED}" = "true" ] || [ "${CATCHUP}" = "success" ]; then
+            arguments+=(--build-started)
+          elif [ "${PUSHED}" = "true" ]; then
+            arguments+=(--build-pending)
+          fi
+          if [ "${kind}" = "conflict" ]; then arguments+=(--conflicts-file "${RUNNER_TEMP}/sync/conflicts.txt"); fi
+          if [ "${GATE_SHELL}" = "failure" ]; then arguments+=(--log "Shell tests=${RUNNER_TEMP}/sync/gate-shell.log"); fi
+          if [ "${GATE_RUNTIME}" = "failure" ]; then arguments+=(--log "Runtime tests=${RUNNER_TEMP}/sync/gate-runtime.log"); fi
+          python3 ops/scripts/sync_issue.py --repo "${GITHUB_REPOSITORY}" report "${arguments[@]}"
+
+          echo "::error::The sync is blocked (${kind}). See the open upstream-sync issue."
+          exit 1

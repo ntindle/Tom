@@ -1,0 +1,41 @@
+name: Checks for main
+
+# Tests the maintenance scripts and lints the workflows on this branch, so a
+# Dependabot pull request that bumps an action gets a signal before it is merged.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: main-checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: Script tests and workflow lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          enable-cache: false
+
+      - name: Script tests
+        shell: bash
+        run: uv run --python 3.13 --no-project --with pytest==8.4.2 python -m pytest -q
+
+      - name: Lint workflows
+        shell: bash
+        run: uvx --from actionlint-py==1.7.12.25 actionlint -color

@@ -1,0 +1,43 @@
+# Fork-owned Dependabot configuration. Dependabot only reads this file from the
+# default branch (`main`), so upstream's own dependabot.yml on `desktop` is inert.
+#
+# Two entries, and nothing else:
+#
+# 1. github-actions at `/` with NO target-branch: it updates the action pins in
+#    main's own workflows. It must never get `target-branch: desktop`. On
+#    `desktop`, `/` holds all of upstream's workflow files, the ecosystem cannot
+#    be limited to one file, and Dependabot would open pull requests that
+#    rewrite upstream's workflows. Every such change is a merge conflict the
+#    next time upstream edits the same file, which it does most weeks.
+#
+# 2. npm for the Electron shell, which exists only on `desktop`.
+#
+# Upstream's Python, frontend and Docker dependencies are upstream's to update;
+# they arrive through the daily sync.
+
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: ci
+    groups:
+      actions:
+        patterns:
+          - "*"
+
+  - package-ecosystem: npm
+    directory: /autogpt_platform/desktop
+    target-branch: desktop
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "build(desktop)"
+    groups:
+      desktop-npm:
+        patterns:
+          - "*"

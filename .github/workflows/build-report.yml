@@ -1,0 +1,72 @@
+name: Report desktop build results
+
+# Puts the result of an installer build of `desktop` into the `upstream-sync`
+# issue: a failed build opens or updates it, the next green build closes it.
+# The sync's own gate is unit tests only; the three-platform build runs after
+# the push, and without this a broken `desktop` would show nowhere but in the
+# list of runs.
+#
+# Two kinds of build count:
+#   - `Desktop build` (desktop-build.yml on main) started by workflow_dispatch:
+#     by the sync after a push, or by hand;
+#   - `AutoGPT Platform - Desktop build` (the caller on `desktop`) for a push
+#     to `desktop`.
+# Pull-request builds and the nightly installed-app tests are not reported.
+#
+# `workflows:` matches by name, so both names above are checked against the
+# workflow file path as well. This job runs no code from the build.
+
+on:
+  workflow_run:
+    workflows:
+      - Desktop build
+      - AutoGPT Platform - Desktop build
+    types: [completed]
+
+permissions: {}
+
+concurrency:
+  group: build-report
+  cancel-in-progress: false
+
+jobs:
+  report:
+    name: Update the sync issue
+    if: >-
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      contains(fromJSON('["success", "failure", "timed_out"]'), github.event.workflow_run.conclusion) &&
+      (
+        (github.event.workflow_run.event == 'workflow_dispatch' &&
+         github.event.workflow_run.path == '.github/workflows/desktop-build.yml') ||
+        (github.event.workflow_run.event == 'push' &&
+         github.event.workflow_run.head_branch == 'desktop' &&
+         github.event.workflow_run.path == '.github/workflows/platform-desktop-build.yml')
+      )
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Check out the automation (main)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Update the issue
+        shell: bash
+        timeout-minutes: 5
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          BUILD_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          if [ "${CONCLUSION}" = "success" ]; then
+            python3 scripts/sync_issue.py --repo "${GITHUB_REPOSITORY}" resolve --kinds build \
+              --message "Fixed: the installers build again. Build: ${BUILD_URL}"
+          else
+            python3 scripts/sync_issue.py --repo "${GITHUB_REPOSITORY}" report --kind build \
+              --run-url "${BUILD_URL}" --build-started
+          fi

@@ -1,0 +1,27 @@
+name: Desktop nightly
+
+# Builds the `desktop` branch every night and tests the installers on fresh
+# machines. Pull requests on `desktop` only build when desktop files change;
+# this run is what notices upstream's backend, frontend or lockfile moving
+# underneath the desktop code. It also fills the caches that pull-request
+# builds restore, which they can only take from this (the default) branch.
+
+on:
+  schedule:
+    - cron: "23 4 * * *"
+
+permissions:
+  contents: read
+
+# A night's run is never cancelled by the next one.
+concurrency:
+  group: desktop-nightly
+  cancel-in-progress: false
+
+jobs:
+  desktop:
+    name: Desktop
+    uses: ./.github/workflows/desktop-build.yml
+    with:
+      ref: desktop
+      e2e: true
