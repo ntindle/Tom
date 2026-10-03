@@ -19,6 +19,8 @@ from autogpt_desktop.layout import EXE, Bundle, DataDir
 from autogpt_desktop.process import ManagedProcess, run_tool, wait_until
 
 NODE_NAME = "rabbit@localhost"
+INETRC_NAME = "erl_inetrc"
+LOOPBACK_DISTRIBUTION = "-kernel inet_dist_use_interface {127,0,0,1}"
 WINDOWS = sys.platform == "win32"
 
 
@@ -43,6 +45,14 @@ def prepare(data: DataDir, port: int, user: str, password: str) -> None:
         encoding="utf-8",
     )
     (base / "enabled_plugins").write_text("[].\n", encoding="utf-8")
+    # The node is named rabbit@localhost. Answer that name from a static
+    # table and leave everything else to the OS resolver; Erlang's own DNS
+    # client would otherwise open a wildcard UDP socket and wait out a 2s
+    # timeout on every boot.
+    (base / INETRC_NAME).write_text(
+        '{lookup, [file, native]}.\n{host, {127,0,0,1}, ["localhost"]}.\n',
+        encoding="utf-8",
+    )
     cookie = base / ".erlang.cookie"
     if not cookie.exists():
         descriptor = os.open(cookie, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o400)
@@ -67,12 +77,18 @@ def environment(bundle: Bundle, data: DataDir, ports: dict[str, int]) -> dict[st
         "RABBITMQ_DIST_PORT": str(ports["rabbitmq_dist"]),
         "ERL_EPMD_PORT": str(ports["epmd"]),
         "ERL_EPMD_ADDRESS": "127.0.0.1",
+        "ERL_INETRC": str(Path(base) / INETRC_NAME),
+        # Erlang distribution listens on every interface unless told
+        # otherwise, and it starts listening before rabbitmq.conf is read.
+        # rabbitmqctl is an Erlang node too. A non-loopback listener is
+        # needless exposure, and on Windows it raises a firewall prompt.
+        "RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS": LOOPBACK_DISTRIBUTION,
+        "RABBITMQ_CTL_ERL_ARGS": LOOPBACK_DISTRIBUTION,
         "ERL_CRASH_DUMP": str(Path(base) / "erl_crash.dump"),
         # Erlang finds its cookie in the home directory; point every flavour
         # of "home" at the data dir so the server and rabbitmqctl agree.
         "HOME": base,
         "USERPROFILE": base,
-        "RUNNING_UNDER_SYSTEMD": "true",
     }
     if WINDOWS:
         drive, rest = os.path.splitdrive(base)
