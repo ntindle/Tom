@@ -56,6 +56,9 @@ PORT_NAMES = (
 
 def allocate(path: Path, names: tuple[str, ...] = PORT_NAMES) -> dict[str, int]:
     stored = _read(path)
+    # A replacement must not land on a port another service already has on
+    # record, or that service would be moved too.
+    remembered = {port for port in stored.values() if isinstance(port, int)}
     ports: dict[str, int] = {}
     for name in names:
         port = stored.get(name)
@@ -64,7 +67,7 @@ def allocate(path: Path, names: tuple[str, ...] = PORT_NAMES) -> dict[str, int]:
         if port is None and name not in stored:
             port = _preferred(name)
         if port is None or port in ports.values():
-            port = _free_port(exclude=set(ports.values()))
+            port = _free_port(exclude=set(ports.values()) | remembered)
             if name in stored:
                 logger.warning(f"the {name} port {stored[name]} is taken; using {port}")
         ports[name] = port

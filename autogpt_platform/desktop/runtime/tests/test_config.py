@@ -52,6 +52,25 @@ def test_a_taken_port_is_replaced_and_the_rest_are_kept(tmp_path: Path, monkeypa
     assert json.loads(path.read_text()) == second
 
 
+def test_a_replacement_port_never_takes_another_services_port(tmp_path: Path, monkeypatch):
+    """Seen on CI: the new public port was drawn from the whole range, landed
+    on the port Valkey had on record, and Valkey was moved as well."""
+    monkeypatch.setattr(ports, "PUBLIC_PORT_PATIENCE_SECONDS", 0)
+    path = tmp_path / "ports.json"
+    first = ports.allocate(path)
+    draws = iter([first["valkey"], first["postgres"]])
+    choose = ports.random.choice
+    monkeypatch.setattr(ports.random, "choice", lambda options: next(draws, None) or choose(options))
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as squatter:
+        squatter.bind(("127.0.0.1", first["public"]))
+        second = ports.allocate(path)
+
+    assert second["public"] not in first.values()
+    assert {k: v for k, v in second.items() if k != "public"} == {
+        k: v for k, v in first.items() if k != "public"
+    }
+
+
 def test_the_public_port_is_waited_for_before_it_is_given_up(tmp_path: Path):
     """It is the app's origin: sessions and OAuth redirect URIs hang off it,
     and its usual holder is a previous run that is still shutting down."""
