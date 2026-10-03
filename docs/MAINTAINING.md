@@ -103,6 +103,16 @@ them.
      `master`, `release-*` or `ci-test*`:
      `gh api -X DELETE repos/ntindle/autogpt/git/refs/heads/<name>`.
 
+   Turn Issues on. A fork starts with them off, and the sync keeps its state
+   in one issue (see [When the `upstream-sync` issue is open](#when-the-upstream-sync-issue-is-open)).
+   Until they are on, every run that has something to report fails with
+   "Issues are turned off".
+
+   ```bash
+   gh repo edit ntindle/autogpt --enable-issues
+   gh api repos/ntindle/autogpt -q .has_issues            # must print: true
+   ```
+
 2. Create the `sync` environment, restrict it to `main`, and store the token
    in it (see [The sync token](#the-sync-token) for how to create the token
    and why it must not be a repository secret).

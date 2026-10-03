@@ -355,6 +355,46 @@ def test_report_arguments_read_files_and_skip_missing_logs(tmp_path: Path) -> No
     assert built.build_pending is False and built.build_started is False
 
 
+def test_a_repository_without_issues_gets_one_line_that_says_how_to_turn_them_on(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class IssuesOff(FakeGitHub):
+        def __init__(self, repository: str, token: str) -> None:
+            super().__init__()
+
+        def request(self, method: str, path: str, *rest: Any, **named: Any) -> Any:
+            if (method, path) == ("POST", "/issues"):
+                raise GitHubError(410, method, path, "Issues has been disabled")
+            return super().request(method, path, *rest, **named)
+
+    monkeypatch.setattr(script, "GitHub", IssuesOff)
+    monkeypatch.setenv("GH_TOKEN", "not-a-token")
+    arguments = ["--repo", "owner/name", "report", "--kind", "build", "--run-url", "u"]
+    assert script.main(arguments) == 1
+    captured = capsys.readouterr()
+    assert "gh repo edit owner/name --enable-issues" in captured.err
+    assert captured.out.startswith("::error title=Issues are turned off::")
+    assert "Traceback" not in captured.err
+
+
+def test_any_other_refusal_is_not_mistaken_for_issues_being_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Forbidden(FakeGitHub):
+        def __init__(self, repository: str, token: str) -> None:
+            super().__init__()
+
+        def request(self, method: str, path: str, *rest: Any, **named: Any) -> Any:
+            if (method, path) == ("POST", "/issues"):
+                raise GitHubError(403, method, path, "Resource not accessible")
+            return super().request(method, path, *rest, **named)
+
+    monkeypatch.setattr(script, "GitHub", Forbidden)
+    monkeypatch.setenv("GH_TOKEN", "not-a-token")
+    with pytest.raises(GitHubError, match="HTTP 403"):
+        script.main(["--repo", "owner/name", "report", "--kind", "build"])
+
+
 def test_build_flags_exclude_each_other() -> None:
     base = ["--repo", "owner/name", "report", "--kind", "error"]
     assert script.parse_arguments([*base, "--pushed", "--build-pending"]).build_pending

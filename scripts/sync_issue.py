@@ -39,6 +39,14 @@ MARKER = re.compile(
 )
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 TAIL_LINES = 60
+# GitHub's answer on a repository whose Issues are off, which a fork is until
+# someone turns them on.
+ISSUES_OFF_STATUS = 410
+ISSUES_OFF = (
+    "Issues are turned off in {repository}, and the sync keeps its state in one."
+    " Turn them on under Settings > General > Features,"
+    " or run: gh repo edit {repository} --enable-issues"
+)
 TAIL_CHARACTERS = 12_000
 MAX_CONFLICTS = 200
 # Job and step results that mean "did not finish": a job that hits its timeout is cancelled.
@@ -114,14 +122,22 @@ def main(argv: list[str] | None = None) -> int:
         write_output("kind", kind)
         return 0
     client = GitHub(args.repo, token_from_environment())
-    if args.command == "report":
-        print(publish(client, report_from_arguments(args)))
-    elif args.command == "resolve":
-        print(resolve(client, set(args.kinds.split(",")), args.message))
-    else:
-        pending = build_is_pending(client)
-        print(f"build pending: {str(pending).lower()}")
-        write_output("pending", str(pending).lower())
+    try:
+        if args.command == "report":
+            print(publish(client, report_from_arguments(args)))
+        elif args.command == "resolve":
+            print(resolve(client, set(args.kinds.split(",")), args.message))
+        else:
+            pending = build_is_pending(client)
+            print(f"build pending: {str(pending).lower()}")
+            write_output("pending", str(pending).lower())
+    except GitHubError as error:
+        if error.status != ISSUES_OFF_STATUS:
+            raise
+        message = ISSUES_OFF.format(repository=args.repo)
+        print(f"::error title=Issues are turned off::{message}")
+        print(message, file=sys.stderr)
+        return 1
     return 0
 
 
