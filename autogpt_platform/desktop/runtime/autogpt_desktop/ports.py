@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import random
 import socket
 import sys
@@ -31,6 +32,15 @@ PUBLIC_PORT_PATIENCE_SECONDS = 5
 # An install that already has a port keeps it: moving it signs the user out
 # and breaks the redirect URIs they registered.
 PREFERRED = {"public": 18473}
+# The shell names the public port of the install it belongs to. A variant of
+# the app (src/identity.js) prefers a port of its own, so that it and the
+# normal app can both keep their address while both are installed.
+PUBLIC_PORT_VARIABLE = "AUTOGPT_DESKTOP_PUBLIC_PORT"
+# Where the shell puts the public ports of variants (src/identity.js
+# VARIANT_PORT_FIRST and VARIANT_PORT_COUNT). No install picks a port for
+# anything from here by chance: a port is remembered for good, and the
+# database of one install would sit on the address of another.
+VARIANT_PUBLIC_PORTS = range(20000, 30000)
 
 PORT_NAMES = (
     "public",
@@ -86,8 +96,21 @@ def _read(path: Path) -> dict[str, object]:
 
 
 def _preferred(name: str) -> int | None:
-    port = PREFERRED.get(name)
+    port = _preferences().get(name)
     return port if port is not None and _is_free(port) else None
+
+
+def _preferences() -> dict[str, int]:
+    """PREFERRED, with the public port the shell asked for. A value that is
+    not a port of PORT_RANGE means no preference at all: falling back to the
+    default would put a variant on the normal app's port."""
+    asked = os.environ.get(PUBLIC_PORT_VARIABLE)
+    if asked is None:
+        return PREFERRED
+    if asked.isdecimal() and int(asked) in PORT_RANGE:
+        return {**PREFERRED, "public": int(asked)}
+    logger.warning(f"ignoring {PUBLIC_PORT_VARIABLE}={asked!r}: not a port in {PORT_RANGE}")
+    return {name: port for name, port in PREFERRED.items() if name != "public"}
 
 
 def _is_free(port: int, *, wait: bool = False) -> bool:
@@ -139,9 +162,13 @@ def _answers(port: int) -> bool:
 
 
 def _free_port(exclude: set[int]) -> int:
-    reserved = exclude | set(PREFERRED.values())
+    # The normal app's address is kept clear by every install, and so is
+    # this install's own and that of every variant there could be.
+    reserved = exclude | set(PREFERRED.values()) | set(_preferences().values())
     for _ in range(1000):
         port = random.choice(PORT_RANGE)
-        if port not in reserved and _is_free(port):
+        if port in reserved or port in VARIANT_PUBLIC_PORTS:
+            continue
+        if _is_free(port):
             return port
     raise RuntimeError("no free local port found")

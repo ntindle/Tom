@@ -9,7 +9,7 @@ import { expect, test } from "@playwright/test";
 
 import { createCalculatorAgent, executionResult, runAndWatch, type Graph } from "../lib/agent";
 import { note, quitAndVerify, recordFailure, startApp, stopStrayApp, type RunningApp } from "../lib/app";
-import { dataDir, firstReadyTimeoutMs, installer, kind } from "../lib/config";
+import { dataDir, firstReadyTimeoutMs, installer, kind, product } from "../lib/config";
 import { beginFirewallCheck } from "../lib/firewall";
 import { appProcesses, platform } from "../lib/platform";
 import { describe } from "../lib/processes";
@@ -123,7 +123,7 @@ function checkLinuxSandbox(): void {
   const restricted = readFlag("/proc/sys/kernel/apparmor_restrict_unprivileged_userns") === "1";
   note("chromium sandbox", `${unsandboxed ? "off" : "on"} (user namespaces restricted: ${restricted})`);
   if (kind === "deb") {
-    if (restricted) expect(fs.existsSync("/etc/apparmor.d/autogpt"), "the .deb installs an AppArmor profile").toBe(true);
+    if (restricted) expect(fs.existsSync(`/etc/apparmor.d/${product.packageName}`), "the .deb installs an AppArmor profile").toBe(true);
     expect(unsandboxed, "the .deb runs with Chromium's sandbox").toBe(false);
   } else if (!restricted) {
     expect(unsandboxed, "nothing here stops the AppImage using Chromium's sandbox").toBe(false);

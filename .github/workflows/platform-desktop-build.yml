@@ -4,10 +4,15 @@ name: AutoGPT Platform - Desktop build
 # all of the desktop automation (.github/workflows/desktop-build.yml there).
 # Only what the desktop bundle is assembled from triggers it; the nightly run
 # on `main` covers changes to the backend and the frontend.
+#
+# A variant (autogpt_platform/desktop/README.md, "Variants") is a branch named
+# `variant/<slug>` that carries this same file. The build on `main` reads the
+# slug from the branch name it is handed, so a variant's pushes, and pull
+# requests into it, are built as that variant and never as the normal app.
 
 on:
   push:
-    branches: [desktop]
+    branches: [desktop, "variant/**"]
     paths:
       - ".github/workflows/platform-desktop-build.yml"
       - "autogpt_platform/desktop/**"
@@ -37,4 +42,5 @@ jobs:
     uses: ntindle/autogpt/.github/workflows/desktop-build.yml@main
     with:
       ref: ${{ github.sha }}
+      branch: ${{ github.base_ref || github.ref_name }}
       e2e: false

@@ -6,7 +6,8 @@ import path from "node:path";
 import { expect, test } from "@playwright/test";
 
 import { verifyFirewall } from "../lib/app";
-import { dataDir, kind, mayUninstall } from "../lib/config";
+import { isOwnUninstallName } from "../../src/identity";
+import { dataDir, kind, mayUninstall, product } from "../lib/config";
 import { appProcesses, platform, run } from "../lib/platform";
 import { describe } from "../lib/processes";
 
@@ -32,16 +33,19 @@ test("uninstalls the app and keeps the data", async () => {
 /** Whether the OS still believes the app is installed. */
 async function registeredWithSystem(): Promise<boolean> {
   if (kind === "nsis") {
-    // Exits with 1 when no uninstall entry mentions the app.
+    // Every DisplayName among the uninstall entries; exits with 1 when
+    // there is none. The entry is this app's only by its whole name: a
+    // search for "AutoGPT" would also find every variant installed here.
     const entries = await run(
       "reg.exe",
-      ["query", "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall", "/s", "/f", "AutoGPT", "/d"],
+      ["query", "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall", "/s", "/v", "DisplayName"],
       { check: false },
     );
-    return entries.code === 0;
+    const names = [...entries.output.matchAll(/^\s*DisplayName\s+REG_SZ\s+(.*?)\s*$/gm)].map((match) => match[1]);
+    return names.some((name) => isOwnUninstallName(product, name));
   }
   if (kind === "deb") {
-    const status = await run("dpkg-query", ["-W", "-f=${Status}", "autogpt"], { check: false });
+    const status = await run("dpkg-query", ["-W", "-f=${Status}", product.packageName], { check: false });
     return status.code === 0 && status.output.includes("install ok installed");
   }
   return false;

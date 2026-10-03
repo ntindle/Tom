@@ -391,6 +391,139 @@ rules; the short version:
 - `bash build/sign_check_macos.sh <SHA-1>` rehearses all of this on a Mac
   that has the certificate, on a copy of a built app, without notarizing.
 
+## Variants
+
+A variant is an experiment: a branch that changes the platform itself, built
+into an app that installs **next to** the normal one and next to other
+variants. It is a branch plus a name:
+
+- the branch is `variant/<slug>`, made from `desktop`;
+- the name is the slug: 1 to 24 lower-case letters, digits or hyphens, not
+  starting or ending with a hyphen (`voice`, `local-models`), given to the
+  build as `AUTOGPT_DESKTOP_VARIANT`. It cannot be `updater` or end in
+  `-updater`: the updater's download cache of another install is called that.
+
+Nothing else names a variant. There is no list of them, and no file is edited
+to add one: every name below is derived from the slug in one place,
+[`src/identity.js`](src/identity.js), which the build
+(`electron-builder.config.js`), the shell and the installed-app tests all
+read.
+
+| | Normal app | Variant `voice` |
+| --- | --- | --- |
+| Name in menus, windows, the tray, the installer | AutoGPT | AutoGPT (voice) |
+| App id (bundle id, uninstall entry, Squirrel) | `co.agpt.autogpt.desktop` | `co.agpt.autogpt.desktop.voice` |
+| Windows install directory | `%LOCALAPPDATA%\Programs\autogpt` | `...\Programs\autogpt-voice` |
+| Windows executable | `AutoGPT.exe` | `autogpt-voice.exe` |
+| macOS bundle | `AutoGPT.app` | `autogpt-voice.app` |
+| `.deb` package, command, AppArmor profile | `autogpt` | `autogpt-voice` |
+| `.deb` install directory | `/opt/AutoGPT` | `/opt/AutoGPT (voice)` |
+| Installer files | `AutoGPT-Setup-1.2.3-x64.exe`, ... | `AutoGPT-voice-Setup-1.2.3-x64.exe`, ... |
+| Data directory | `AutoGPT` (see [Where data lives](#where-data-lives)) | `AutoGPT-voice`, in the same place |
+| Electron profile (cookies, the single-instance lock) | `AutoGPT` in the system's app-data folder | `AutoGPT-voice` |
+| Updater's download cache | `autogpt-updater` | `autogpt-voice-updater` |
+| Address it prefers | `http://localhost:18473` | `http://localhost:25954` (from the slug, 20000-29999) |
+| Cookie names in a browser | as the platform names them | `AutoGPT-voice.<name>` |
+| With `AUTOGPT_DESKTOP_DATA_DIR=D:\data` | `D:\data` | `D:\data-voice` |
+| Release tags | `desktop-v<version>` | `desktop-voice-v<version>` |
+
+**Nothing is shared.** A variant has its own database, its own secrets, its
+own ports, its own sign-in, its own browser profile and its own logs. It can
+run at the same time as the normal app. A variant may migrate its database to
+a schema the normal app has never heard of and the normal app's data is not
+touched by it; for the same reason there is no way to move data from one to
+the other, and uninstalling one leaves the others alone.
+
+What follows from the separate address: a variant's OAuth redirect URL is its
+own (tray menu, *Copy OAuth redirect URL*), so an integration connected in
+the normal app has to be connected again in the variant. The address is only
+preferred, as for the normal app: an install keeps the port it first got, and
+takes another when that one is taken. Two slugs can hash to the same port;
+the one that starts second on a machine then gets another. No install puts
+one of its internal services on a port between 20000 and 29999, so a
+variant's address is not taken by another install's database.
+
+Four things would be shared if nothing were done about them, and are not:
+
+- **The data directory named in the environment.** `AUTOGPT_DESKTOP_DATA_DIR`
+  is one value for every program a user starts. It names the normal app's
+  directory; a variant takes the one next to it, `<directory>-<slug>`
+  (`src/paths.js`). The installed-app tests follow the same rule.
+- **A data directory reached some other way** (a link, a directory given to
+  one install that is already another's). The first install to use a data
+  directory leaves its name in `autogpt-install.json` there, and an install
+  that finds another's name starts nothing and says so. A directory that
+  holds data and no name is the normal app's.
+- **Cookies in a browser.** *Open in browser* shows every install at
+  `127.0.0.1`, and a browser keeps cookies per host, whatever the port. The
+  runtime's proxy gives a variant's cookies names of their own and passes on
+  to the platform only the cookies of its own install
+  (`runtime/autogpt_desktop/cookies.py`), so signing in to one install does
+  not sign the other out, and an experiment is never sent the normal app's
+  session. The normal app's cookie names are unchanged. In a variant, a
+  cookie that a page sets itself with `document.cookie` does not reach the
+  server, and a script sees the server's cookies under the longer name; the
+  platform's sign-in uses neither.
+- **The programs a Windows installer closes.** electron-builder's installer
+  closes every program whose path starts with the install directory's, and
+  `...\Programs\autogpt` is the start of `...\Programs\autogpt-voice`: an
+  update of the normal app would stop a running variant, database and all.
+  `resources/installer.nsh` replaces that check with one that ends the
+  directory's name with a backslash; `test/packaging.test.js` holds it
+  against electron-builder's template.
+
+**Updates never cross.** The normal app follows the repository's latest
+release. A variant's releases are GitHub *pre-releases* tagged
+`desktop-<slug>-v<version>`, and GitHub's latest release is never a
+pre-release, so the normal app is never shown one. A variant does not look at
+"latest" at all: it is built without that address. It lists the repository's
+releases, takes the highest plain version (`X.Y.Z`) among the tags that are
+exactly its own, and reads that one release. On top of both, every app
+refuses an update unless each file in it is its own installer by name
+(`AutoGPT-voice-...` for `voice`), whatever release it came from.
+`test/variants.test.js` runs electron-updater's two providers against a
+recorded network to hold this in place.
+
+A variant asks `api.github.com` for the release list, without signing in:
+GitHub allows 60 such requests an hour from one address, which the four
+looks a day stay far below. A look that is refused is tried again at the next
+one.
+
+### Making one
+
+```bash
+git switch -c variant/voice desktop        # the experiment lives here
+# ... change anything, anywhere in the repository ...
+git push -u ntindle variant/voice
+```
+
+To build it locally, set the variable for the packaging step (the runtime
+bundle is the same for every variant of one commit):
+
+```bash
+AUTOGPT_DESKTOP_VARIANT=voice npx electron-builder --config electron-builder.config.js --publish never
+AUTOGPT_DESKTOP_VARIANT=voice npm start    # from the source tree, without packaging
+```
+
+On GitHub the slug is taken from the branch name: pushes to `variant/**` and
+pull requests into such a branch are built as that variant by the same
+workflows as `desktop`. Building, releasing, keeping a variant in step with
+`desktop` and retiring one are in `docs/MAINTAINING.md` on `main`,
+"Variants".
+
+**A build of a variant branch without the slug is the normal app with the
+experiment's code in it**, and would open the normal app's data. The
+workflows refuse to make one: a build that names no variant must be of a
+commit that is on `desktop`, or of a pull request. Do not install one you
+built by hand on a machine whose AutoGPT data matters.
+
+An installed app is the variant it was built as, whatever
+`AUTOGPT_DESKTOP_VARIANT` says in the environment it is started from; the
+variable only chooses when running from the source tree.
+
+Not verified yet: installing two variants side by side, and an update of an
+installed variant. Both need a build from the workflows.
+
 ## Building
 
 Needs `uv`, and `pnpm` (on Windows; elsewhere the build fetches it).

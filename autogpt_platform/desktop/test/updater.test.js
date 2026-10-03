@@ -22,6 +22,10 @@ const {
   withUpdatesMenu,
 } = require("../src/updater");
 
+// These tests are of the normal app, whatever variant the environment they
+// run in names (variants.test.js has the variants).
+delete process.env.AUTOGPT_DESKTOP_VARIANT;
+
 const RELEASED = { version: "1.4.0", isPackaged: true };
 
 // electron-updater's autoUpdater, as far as updater.js uses it.

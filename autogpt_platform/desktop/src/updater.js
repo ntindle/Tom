@@ -26,10 +26,35 @@
 // A version that has been downloaded or announced is not kept for ever: the
 // checks go on, and when the latest release is no longer that version (it
 // was withdrawn, or a newer one is out) the app follows.
+//
+// Variants (identity.js) are released in the same repository and never
+// cross: the normal app must not become an experiment, and an experiment
+// must not become the normal app or another experiment.
+//
+// - A variant's releases are GitHub pre-releases tagged
+//   `desktop-<slug>-v<version>`. GitHub's latest release is never a
+//   pre-release, and that one release is all electron-updater's GitHub
+//   provider looks at for the normal app (allowPrerelease is off).
+// - A variant does not use that provider at all. It lists the repository's
+//   releases, takes the highest version among the tags that are exactly its
+//   own (newestRelease), and points electron-updater's generic provider at
+//   the files of that one release.
+// - Whatever a release's metadata names, an update is refused unless every
+//   file in it is this app's own installer by name (isOwnUpdateFile).
 
 const fs = require("node:fs");
 
+const { NORMAL, isOwnUpdateFile, releaseTag } = require("./identity");
+
 const RELEASES = "https://github.com/ntindle/autogpt/releases";
+const RELEASES_API = "https://api.github.com/repos/ntindle/autogpt/releases";
+const RELEASES_PER_PAGE = 100;
+// Releases come newest first. A variant that has not been released within
+// the repository's last 500 releases is not offered an update.
+const MAX_RELEASE_PAGES = 5;
+// A version with a pre-release part (1.3.0-rc.1) gets a release page and is
+// offered to nobody, for a variant as for the normal app.
+const PLAIN_VERSION = /^(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)$/;
 const FIRST_CHECK_MS = 60_000;
 const CHECK_EVERY_MS = 6 * 60 * 60_000;
 // How long "Restart to update" waits to hear whether the version it holds is
@@ -79,8 +104,63 @@ function installsFromDownloadedFile(platform) {
   return platform !== "darwin";
 }
 
-function releaseUrl(version) {
-  return version ? `${RELEASES}/tag/desktop-v${version}` : `${RELEASES}/latest`;
+function releaseUrl(version, id = NORMAL) {
+  if (version) return `${RELEASES}/tag/${releaseTag(id, version)}`;
+  // The repository's latest release is the normal app's.
+  return id.variant ? RELEASES : `${RELEASES}/latest`;
+}
+
+// The release a variant updates to: of the published releases whose tag is
+// exactly `desktop-<slug>-v<X.Y.Z>`, the one with the highest version. Null
+// when there is none. `releases` is GitHub's list (tag_name, draft).
+function newestRelease(releases, id) {
+  let newest = null;
+  for (const release of releases) {
+    const tag = release?.tag_name;
+    if (release?.draft || typeof tag !== "string" || !tag.startsWith(id.tagPrefix)) continue;
+    const version = tag.slice(id.tagPrefix.length);
+    const numbers = PLAIN_VERSION.exec(version)?.slice(1).map(Number);
+    if (!numbers) continue;
+    if (!newest || isHigher(numbers, newest.numbers)) newest = { tag, version, numbers };
+  }
+  return newest && { tag: newest.tag, version: newest.version };
+}
+
+function isHigher(numbers, than) {
+  const differs = numbers.findIndex((number, index) => number !== than[index]);
+  return differs !== -1 && numbers[differs] > than[differs];
+}
+
+// Where electron-updater's generic provider finds latest*.yml and the
+// installers of one release.
+function feedUrl(tag) {
+  return `${RELEASES}/download/${tag}`;
+}
+
+// The feed of one release, as electron-updater's generic provider takes it:
+// in app-update.yml (electron-builder.config.js) and when a variant moves on
+// to a newer release. GitHub answers a request for several ranges at once
+// with 501, and the generic provider would send one for every differential
+// download and then fetch the whole installer instead; its GitHub provider
+// turns them off for the same reason.
+function releaseFeed(tag) {
+  return { provider: "generic", url: feedUrl(tag), useMultipleRangeRequest: false };
+}
+
+// For a variant: asks GitHub for the repository's releases and picks this
+// variant's newest. `fetchJson` resolves to the parsed answer of a URL and
+// rejects on anything else.
+function variantReleaseFinder({ id, fetchJson }) {
+  return async function findRelease() {
+    const releases = [];
+    for (let page = 1; page <= MAX_RELEASE_PAGES; page += 1) {
+      const listed = await fetchJson(`${RELEASES_API}?per_page=${RELEASES_PER_PAGE}&page=${page}`);
+      if (!Array.isArray(listed)) throw new Error("GitHub did not answer with a list of releases");
+      releases.push(...listed);
+      if (listed.length < RELEASES_PER_PAGE) break;
+    }
+    return newestRelease(releases, id);
+  };
 }
 
 const IDLE = { phase: "idle", version: null, checked: false };
@@ -147,7 +227,13 @@ function createUpdater({
   timers = globalThis,
   needsDownloadedFile = false,
   fileExists = fs.existsSync,
+  identity: id = NORMAL,
+  findRelease = null,
 }) {
+  if (id.variant && !findRelease) {
+    // Without it the only thing left to ask would be the normal app's feed.
+    throw new Error("a variant needs findRelease to look for its own releases");
+  }
   let state = IDLE;
   let armed = false;
   let downloadedFile = null;
@@ -161,7 +247,20 @@ function createUpdater({
     return true;
   }
 
+  // Every file the release's metadata names must be this app's installer.
+  // A release of another variant, or of the normal app, that ended up where
+  // this app looks is refused here, before anything is downloaded.
+  function isOwnUpdate(info) {
+    const named = [...(info.files || []).map((file) => file?.url), ...(info.path ? [info.path] : [])];
+    return named.every((name) => isOwnUpdateFile(id, info.version, name));
+  }
+
   autoUpdater.on("update-available", (info) => {
+    if (!isOwnUpdate(info)) {
+      logger?.error(`Refused version ${info.version}: its files are not ${id.productName}'s.`);
+      apply({ type: "error" });
+      return;
+    }
     const changed = apply({ type: "available", version: info.version });
     if (changed && state.phase === "downloading") download();
   });
@@ -189,7 +288,27 @@ function createUpdater({
 
   function check() {
     if (["downloading", "installing", "failed"].includes(state.phase)) return Promise.resolve();
-    return settled(() => autoUpdater.checkForUpdates(), "check for updates");
+    return settled(id.variant ? checkOwnReleases : () => autoUpdater.checkForUpdates(), "check for updates");
+  }
+
+  // A variant: find its newest release, then let electron-updater read that
+  // release and nothing else. No release (none yet, or all withdrawn) is
+  // "nothing newer"; a list that could not be read is a failed check.
+  async function checkOwnReleases() {
+    let release;
+    try {
+      release = await findRelease();
+      if (release) autoUpdater.setFeedURL(releaseFeed(release.tag));
+    } catch (error) {
+      logger?.warn(`Could not find this variant's releases: ${error.message || error}`);
+      apply({ type: "error" });
+      return;
+    }
+    if (!release) {
+      apply({ type: "current" });
+      return;
+    }
+    await autoUpdater.checkForUpdates();
   }
 
   function download() {
@@ -328,11 +447,15 @@ module.exports = {
   createUpdater,
   dropsUpdaterQuit,
   failedStartOffer,
+  feedUrl,
+  releaseFeed,
   fileLogger,
   installsFromDownloadedFile,
+  newestRelease,
   nextState,
   releaseUrl,
   updateMenuItems,
   updateMode,
+  variantReleaseFinder,
   withUpdatesMenu,
 };

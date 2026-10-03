@@ -12,6 +12,11 @@
 //                              0.0.0-dev.0 otherwise (a development build,
 //                              which never looks for updates)
 //   AUTOGPT_DESKTOP_OUTPUT     where the installers are written; dist
+//   AUTOGPT_DESKTOP_VARIANT    the slug of a variant, such as "voice": an app
+//                              that installs next to the normal one and
+//                              shares nothing with it. Empty for the normal
+//                              app. src/identity.js derives every name here
+//                              from it; README.md, "Variants".
 //   AUTOGPT_DESKTOP_MAC_SIGN   "developer-id": sign with the Developer ID
 //                              certificate in CSC_LINK (or the keychain),
 //                              hardened runtime, notarize. Anything else:
@@ -28,6 +33,8 @@
 
 const path = require("node:path");
 
+const { artifactNames, identity, releaseTag } = require("./src/identity");
+const { releaseFeed } = require("./src/updater");
 const {
   requireNotarizedApp,
   signMacApp,
@@ -49,9 +56,9 @@ const AZURE_SETTINGS = {
   publisherName: "AZURE_SIGN_PUBLISHER",
 };
 
-const PRODUCT = "AutoGPT";
-
 const env = process.env;
+const app = identity(env.AUTOGPT_DESKTOP_VARIANT || "");
+const names = artifactNames(app);
 const macDeveloperId = env.AUTOGPT_DESKTOP_MAC_SIGN === "developer-id";
 const windowsSigning = ["azure", "pfx"].includes(env.AUTOGPT_DESKTOP_WIN_SIGN)
   ? env.AUTOGPT_DESKTOP_WIN_SIGN
@@ -66,10 +73,40 @@ function version() {
   return { version: value };
 }
 
+// What the packed app's package.json says besides what the file in the
+// repository says. A variant is another package under another name, and
+// src/identity.js variantOf reads the slug back in the installed app.
+function metadata() {
+  // Read by src/updater.js: macOS replaces an app in place only when the
+  // old and the new one are signed by the same Developer ID.
+  const built = { macDeveloperId };
+  if (!app.variant) return { ...version(), autogptDesktop: built };
+  return {
+    ...version(),
+    name: app.packageName,
+    productName: app.productName,
+    autogptDesktop: { ...built, variant: app.variant },
+  };
+}
+
+// Where an installed app looks for updates (written to app-update.yml).
+// Nothing is uploaded from here: the release workflow on `main` does that.
+//
+// The normal app follows the release GitHub marks as the repository's
+// latest. A variant must never do that, so it is not given the means: the
+// only address it is built with is the release it was built for, and
+// src/updater.js moves it on to a newer release of the same variant once it
+// has found one.
+function publish() {
+  if (!app.variant) return [{ provider: "github", owner: "ntindle", repo: "autogpt" }];
+  const built = version().version || require("./package.json").version;
+  return [releaseFeed(releaseTag(app, built))];
+}
+
 function mac() {
   const common = {
     category: "public.app-category.productivity",
-    artifactName: "AutoGPT-${version}-${arch}.${ext}",
+    artifactName: names.mac,
     gatekeeperAssess: false,
   };
   if (!macDeveloperId) {
@@ -132,7 +169,7 @@ function azureSignOptions() {
 function signedAppOrNothing() {
   let checked = null;
   return (event) => {
-    checked ||= requireNotarizedApp(path.join(path.dirname(event.file), "mac-arm64", `${PRODUCT}.app`));
+    checked ||= requireNotarizedApp(path.join(path.dirname(event.file), "mac-arm64", `${app.productFilename}.app`));
     return checked;
   };
 }
@@ -146,8 +183,9 @@ function signsOnThisSystem() {
 }
 
 module.exports = {
-  appId: "co.agpt.autogpt.desktop",
-  productName: PRODUCT,
+  appId: app.appId,
+  productName: app.productName,
+  ...(app.executableName ? { executableName: app.executableName } : {}),
   directories: {
     output: env.AUTOGPT_DESKTOP_OUTPUT || "dist",
     buildResources: "resources",
@@ -159,17 +197,10 @@ module.exports = {
   // Electron. Left on, electron-builder runs a rebuild of the dependencies
   // while it packages, which is also when it holds the certificates.
   npmRebuild: false,
-  extraMetadata: {
-    ...version(),
-    // Read by src/updater.js: macOS replaces an app in place only when the
-    // old and the new one are signed by the same Developer ID.
-    autogptDesktop: { macDeveloperId },
-  },
+  extraMetadata: metadata(),
   forceCodeSigning: signsOnThisSystem(),
   ...(macDeveloperId && process.platform === "darwin" ? { artifactBuildStarted: signedAppOrNothing() } : {}),
-  // Where an installed app looks for updates (written to app-update.yml).
-  // Nothing is uploaded from here: the release workflow on `main` does that.
-  publish: [{ provider: "github", owner: "ntindle", repo: "autogpt" }],
+  publish: publish(),
   // The update files are always latest*.yml, also for 1.2.3-rc.1: there is
   // one channel.
   detectUpdateChannel: false,
@@ -178,15 +209,19 @@ module.exports = {
     oneClick: true,
     perMachine: false,
     deleteAppDataOnUninstall: false,
-    artifactName: "AutoGPT-Setup-${version}-${arch}.${ext}",
+    artifactName: names.nsis,
+    // Which running programs the installer closes: this install's, and not
+    // those of an install whose folder name merely starts the same.
+    include: "resources/installer.nsh",
   },
   mac: mac(),
   linux: {
     target: ["AppImage", "deb"],
     category: "Utility",
   },
-  // No version in the AppImage's name: it updates itself by replacing its
-  // own file, and a launcher that points at it must keep working.
-  appImage: { artifactName: "AutoGPT-${arch}.${ext}" },
-  deb: { artifactName: "AutoGPT-${version}-${arch}.${ext}" },
+  // No version in the AppImage's name (src/identity.js artifactNames): it
+  // updates itself by replacing its own file, and a launcher that points at
+  // it must keep working.
+  appImage: { artifactName: names.appImage },
+  deb: { artifactName: names.deb },
 };

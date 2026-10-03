@@ -2,8 +2,15 @@
 // variable; nothing else in the harness reads process.env for configuration.
 
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
+
+import { identity } from "../../src/identity";
+import { defaultDataDir } from "../../src/paths";
+
+/** Which app is under test: the normal one, or the variant the installers
+ * were built as. Every name and path below comes from the definition the
+ * build itself uses (src/identity.js). */
+export const product = identity(process.env.AUTOGPT_DESKTOP_VARIANT || "");
 
 export type Kind = "nsis" | "dmg" | "deb" | "appimage";
 
@@ -38,17 +45,11 @@ export const readyTimeoutMs = seconds("AUTOGPT_E2E_READY_SECONDS", 300);
 export const dataDirOverride =
   process.env.AUTOGPT_E2E_DATA_DIR || process.env.AUTOGPT_DESKTOP_DATA_DIR || null;
 
-/** Mirrors src/paths.js defaultDataDir. */
+/** Where the app under test keeps its data, by the app's own rule
+ * (src/paths.js). A variant that is given a directory uses the one next to
+ * it, `<directory>-<slug>`: the directory itself is the normal app's. */
 export function dataDir(): string {
-  if (dataDirOverride) return path.resolve(dataDirOverride);
-  const home = os.homedir();
-  if (process.platform === "win32") {
-    return path.join(process.env.LOCALAPPDATA || path.join(home, "AppData", "Local"), "AutoGPT");
-  }
-  if (process.platform === "darwin") {
-    return path.join(home, "Library", "Application Support", "AutoGPT");
-  }
-  return path.join(process.env.XDG_DATA_HOME || path.join(home, ".local", "share"), "AutoGPT");
+  return path.resolve(defaultDataDir(process.platform, appEnvironment(), product));
 }
 
 /** The app under test must not look for updates: a release build would

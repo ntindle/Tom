@@ -12,14 +12,16 @@ const {
   dialog,
   ipcMain,
   nativeImage,
+  net,
   session,
   shell,
 } = require("electron");
 
+const { claim, identity, runtimeEnvironment, variantOf, windowTitle } = require("./identity");
 const { allowsPermission, classifyMainNavigation, classifyWindowOpen } = require("./navigation");
 const { hearsRuntime } = require("./lifecycle");
 const { applicationMenuTemplate, ownerMenuItems } = require("./owner");
-const { defaultDataDir, readRuntimeManifest, runtimeDir } = require("./paths");
+const { claimDataDir, defaultDataDir, readRuntimeManifest, runtimeDir } = require("./paths");
 const { openResetPasswordWindow } = require("./reset-password-window");
 const { Runtime } = require("./runtime");
 const {
@@ -32,11 +34,20 @@ const {
   releaseUrl,
   updateMenuItems,
   updateMode,
+  variantReleaseFinder,
   withUpdatesMenu,
 } = require("./updater");
 
 const ICON = path.join(__dirname, "icon.png");
-const dataDir = defaultDataDir();
+const RELEASE_LIST_TIMEOUT_MS = 30_000;
+// Which install this is: the normal app, or a variant that shares nothing
+// with it (identity.js). Claimed before the single-instance lock below,
+// which Electron keeps in the profile directory.
+const install = identity(
+  variantOf({ isPackaged: app.isPackaged, manifest: require("../package.json"), env: process.env }),
+);
+claim(app, install);
+const dataDir = defaultDataDir(process.platform, process.env, install);
 const logsDir = path.join(dataDir, "logs");
 const settingsFile = path.join(dataDir, "config", "settings.env");
 
@@ -48,6 +59,7 @@ let appUrl = null;
 let quitting = false;
 let restarting = false;
 let failure = null;
+let foreignData = null;
 let updater = null;
 let updaterStarted = false;
 let confirmingUpdate = false;
@@ -60,16 +72,38 @@ if (!app.requestSingleInstanceLock()) {
 } else {
   app.on("second-instance", () => focusWindow());
   app.on("web-contents-created", (_, contents) => routeNewWindows(contents));
+  app.on("browser-window-created", (_, window) => nameWindow(window));
   app.whenReady().then(boot);
 }
 
 function boot() {
-  fs.mkdirSync(logsDir, { recursive: true });
   restrictPermissions(session.defaultSession);
   createTray();
+  foreignData = dataOfAnotherInstall();
+  if (!foreignData) fs.mkdirSync(logsDir, { recursive: true });
   refreshMenus();
   showStartupWindow();
-  startRuntime();
+  if (foreignData) report({ event: "error", fatal: true, message: foreignData });
+  else startRuntime();
+}
+
+// What to say when the data directory belongs to another install (paths.js
+// claimDataDir), or null. Nothing is started on such a directory and
+// nothing is written to it: this install's migrations would run on the
+// other one's database.
+function dataOfAnotherInstall() {
+  let owner;
+  try {
+    owner = claimDataDir(dataDir, install);
+  } catch {
+    // A directory that cannot be written to: the runtime says so better.
+    return null;
+  }
+  if (owner === install.dirName) return null;
+  return (
+    `${dataDir} holds the data of another install of AutoGPT (${owner}), and ${install.productName} ` +
+    "will not open it. If AUTOGPT_DESKTOP_DATA_DIR is set, it is what led here: change or remove it, then start again."
+  );
 }
 
 function startRuntime() {
@@ -89,6 +123,7 @@ function startRuntime() {
     cwd: dir,
     env: {
       ...manifest.env,
+      ...runtimeEnvironment(install),
       AUTOGPT_DESKTOP_DATA_DIR: dataDir,
       AUTOGPT_DESKTOP_SHELL_VERSION: app.getVersion(),
     },
@@ -166,7 +201,20 @@ function startUpdater() {
     logger: fileLogger(path.join(logsDir, "updater.log")),
     onChange: onUpdateState,
     needsDownloadedFile: installsFromDownloadedFile(process.platform),
+    identity: install,
+    findRelease: install.variant ? variantReleaseFinder({ id: install, fetchJson }) : null,
   });
+}
+
+// Through Chromium's network stack, like electron-updater's own requests,
+// so that the system's proxy settings apply.
+async function fetchJson(url) {
+  const response = await net.fetch(url, {
+    headers: { Accept: "application/vnd.github+json" },
+    signal: AbortSignal.timeout(RELEASE_LIST_TIMEOUT_MS),
+  });
+  if (!response.ok) throw new Error(`${url} answered ${response.status}`);
+  return response.json();
 }
 
 function onUpdateState({ phase, version }) {
@@ -181,7 +229,7 @@ function onUpdateState({ phase, version }) {
     phase === "ready"
       ? "Choose Restart to update in the AutoGPT menu when it suits you."
       : "Open the AutoGPT menu to download it.";
-  new Notification({ title: `AutoGPT ${version} is available`, body }).show();
+  new Notification({ title: `${install.productName} ${version} is available`, body }).show();
 }
 
 // Stops the runtime as a quit does, which waits out a database migration,
@@ -217,7 +265,7 @@ async function userWantsTheUpdate() {
   const { version } = updater.state();
   const question = {
     type: "question",
-    message: `Restart AutoGPT to update to ${version}?`,
+    message: `Restart ${install.productName} to update to ${version}?`,
     detail: "Agents that are running now will be stopped.",
     buttons: ["Restart", "Later"],
     defaultId: 0,
@@ -251,7 +299,7 @@ function sendUpdateOffer() {
 function takeUpdateOffer() {
   const offer = failedStartOffer(updater?.state());
   if (offer?.action === "install") restartToUpdate();
-  if (offer?.action === "open") shell.openExternal(releaseUrl(updater.state().version));
+  if (offer?.action === "open") shell.openExternal(releaseUrl(updater.state().version, install));
 }
 
 function updateItems() {
@@ -259,7 +307,7 @@ function updateItems() {
     state: updater?.state(),
     check: () => updater.check(),
     install: restartToUpdate,
-    openRelease: (version) => shell.openExternal(releaseUrl(version)),
+    openRelease: (version) => shell.openExternal(releaseUrl(version, install)),
   });
 }
 
@@ -275,7 +323,7 @@ function showStartupWindow() {
     width: 520,
     height: 360,
     resizable: false,
-    title: "AutoGPT",
+    title: install.productName,
     icon: ICON,
     show: false,
     autoHideMenuBar: true,
@@ -304,7 +352,7 @@ function openMainWindow() {
     height: 900,
     minWidth: 900,
     minHeight: 600,
-    title: "AutoGPT",
+    title: install.productName,
     icon: ICON,
     show: false,
     autoHideMenuBar: true,
@@ -353,7 +401,19 @@ function showProgressInsteadOfTheApp() {
 }
 
 function resetOwnerPassword() {
+  if (foreignData) return focusWindow();
   openResetPasswordWindow({ icon: ICON, dataDir, onWritten: restartRuntime });
+}
+
+// A page names its own window, and the platform's pages name themselves the
+// same in every install: a variant's windows say which one they are.
+function nameWindow(window) {
+  window.on("page-title-updated", (event, title) => {
+    const named = windowTitle(install, title);
+    if (named === null) return;
+    event.preventDefault();
+    window.setTitle(named);
+  });
 }
 
 // See navigation.js for what stays in the app and why.
@@ -426,13 +486,13 @@ function focusWindow() {
 
 function createTray() {
   tray = new Tray(nativeImage.createFromPath(ICON).resize({ width: 16, height: 16 }));
-  tray.setToolTip("AutoGPT");
+  tray.setToolTip(install.productName);
   tray.on("click", focusWindow);
 }
 
 function trayMenu() {
   return Menu.buildFromTemplate([
-    { label: "Open AutoGPT", click: focusWindow },
+    { label: `Open ${install.productName}`, click: focusWindow },
     { label: "Open in browser", click: () => appUrl && shell.openExternal(appUrl) },
     { label: "Settings file (API keys)", click: () => shell.openPath(settingsFile) },
     { label: "Show logs", click: () => shell.openPath(logsDir) },
@@ -440,7 +500,7 @@ function trayMenu() {
     ...ownerItems(),
     { type: "separator" },
     ...updateItems(),
-    { label: "Quit AutoGPT", click: () => app.quit() },
+    { label: `Quit ${install.productName}`, click: () => app.quit() },
   ]);
 }
 
@@ -474,6 +534,6 @@ app.on("before-quit", (event) => {
   startupWindow?.webContents.send("runtime-event", { event: "progress", message: "Stopping AutoGPT…" });
   runtime
     .stop()
-    .catch((error) => dialog.showErrorBox("AutoGPT", `Could not stop cleanly: ${error.message}`))
+    .catch((error) => dialog.showErrorBox(install.productName, `Could not stop cleanly: ${error.message}`))
     .finally(() => app.exit(0));
 });

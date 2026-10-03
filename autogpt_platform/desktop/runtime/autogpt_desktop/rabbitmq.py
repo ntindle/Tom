@@ -18,6 +18,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+from autogpt_desktop import install
 from autogpt_desktop.layout import EXE, SCRIPT, Bundle, DataDir, write_private
 from autogpt_desktop.process import ManagedProcess, base_env, run_tool
 
@@ -224,9 +225,12 @@ def _alias_root() -> Path:
         cache = Path.home() / "Library" / "Caches"
     else:
         cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
-    root = cache / "AutoGPT" / "links"
+    # A folder of its own for each install: a variant of the app shares
+    # none with the normal app.
+    name = install.name()
+    root = cache / name / "links"
     if any(character.isspace() for character in str(root)):
-        root = Path(tempfile.gettempdir()) / f"autogpt-desktop-{os.getuid()}"
+        root = Path(tempfile.gettempdir()) / f"{name.lower()}-desktop-{os.getuid()}"
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     return root
 

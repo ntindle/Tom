@@ -12,6 +12,7 @@ const CONFIG = path.join(DESKTOP, "electron-builder.config.js");
 const SETTINGS = [
   "AUTOGPT_DESKTOP_VERSION",
   "AUTOGPT_DESKTOP_OUTPUT",
+  "AUTOGPT_DESKTOP_VARIANT",
   "AUTOGPT_DESKTOP_MAC_SIGN",
   "AUTOGPT_DESKTOP_WIN_SIGN",
   "AZURE_SIGN_ENDPOINT",
@@ -205,7 +206,79 @@ test("certificates and passwords never pass through the configuration", () => {
   assert.deepEqual([...new Set(read)].sort(), [
     "AUTOGPT_DESKTOP_MAC_SIGN",
     "AUTOGPT_DESKTOP_OUTPUT",
+    "AUTOGPT_DESKTOP_VARIANT",
     "AUTOGPT_DESKTOP_VERSION",
     "AUTOGPT_DESKTOP_WIN_SIGN",
   ]);
+});
+
+// --- the Windows installer and other installs ---------------------------------
+
+const INCLUDE = path.join(DESKTOP, "resources", "installer.nsh");
+const TEMPLATE = path.join(
+  DESKTOP,
+  "node_modules",
+  "app-builder-lib",
+  "templates",
+  "nsis",
+  "include",
+  "allowOnlyOneInstallerInstance.nsh",
+);
+
+function macro(source, name) {
+  const found = new RegExp(`^!macro ${name}\\b[\\s\\S]*?^!macroend[ \\t]*$`, "m").exec(source);
+  return found ? found[0].replace(/[ \t]+$/gm, "") : null;
+}
+
+test("every Windows installer closes the programs of its own install only", () => {
+  // Install directories are siblings whose names start the same:
+  // ...\Programs\autogpt, ...\Programs\autogpt-voice, ...\Programs\autogpt-voice2.
+  for (const variant of ["", "voice"]) {
+    const config = configured({ AUTOGPT_DESKTOP_VARIANT: variant });
+    assert.equal(config.nsis.include, "resources/installer.nsh");
+    assert.equal(config.directories.buildResources, "resources");
+  }
+  const include = fs.readFileSync(INCLUDE, "utf8").replace(/\r\n/g, "\n");
+  // This macro is what makes electron-builder's template use the check below.
+  assert.match(include, /^!macro customCheckAppRunning\n {2}!insertmacro IS_POWERSHELL_AVAILABLE\n {2}!insertmacro OWN_CHECK_APP_RUNNING\n!macroend$/m);
+  // A program is the install's if its path starts with the directory and a
+  // backslash; the directory's name alone is also the start of a sibling's.
+  const compared = [...include.matchAll(/^[^#\n]*StartsWith\('([^']*)'/gm)].map((match) => match[1]);
+  assert.deepEqual(compared, ["$INSTDIR\\", "$INSTDIR\\"]);
+  for (const body of ["OWN_FIND_PROCESS", "OWN_KILL_PROCESS", "OWN_CHECK_APP_RUNNING"].map((name) => macro(include, name))) {
+    assert.ok(body, "installer.nsh lost one of its macros");
+    assert.ok(!/!insertmacro (FIND|KILL)_PROCESS/.test(body), "a check of electron-builder's own is still used");
+  }
+});
+
+test("the installer's check is electron-builder's, changed in two places", (t) => {
+  if (!fs.existsSync(TEMPLATE)) return t.skip("electron-builder is not installed (npm ci)");
+  const template = fs.readFileSync(TEMPLATE, "utf8").replace(/\r\n/g, "\n");
+  const include = fs.readFileSync(INCLUDE, "utf8").replace(/\r\n/g, "\n");
+  // The template still takes a replacement, and still needs one.
+  assert.match(template, /!ifmacrodef customCheckAppRunning\n\s+!insertmacro customCheckAppRunning\n\s+!else/);
+  assert.equal(template.split("StartsWith('$INSTDIR', 'CurrentCultureIgnoreCase')").length - 1, 2);
+  // What installer.nsh needs from the template and from its include folder.
+  assert.ok(macro(template, "IS_POWERSHELL_AVAILABLE"));
+  assert.match(template, /!ifmacrondef customCheckAppRunning\n\s+!include "getProcessInfo\.nsh"\n\s+Var pid\n!endif/);
+  assert.ok(fs.existsSync(path.join(path.dirname(TEMPLATE), "getProcessInfo.nsh")));
+  assert.match(include, /^!include "getProcessInfo\.nsh"\nVar pid$/m);
+
+  const own = (text) =>
+    text
+      .replaceAll("'$INSTDIR'", "'$INSTDIR\\'")
+      .replace("if ((Get-CimInstance", "if (@(Get-CimInstance")
+      .replace(/^!macro _CHECK_APP_RUNNING/, "!macro OWN_CHECK_APP_RUNNING")
+      .replace(/!(insert)?macro (FIND|KILL)_PROCESS/g, "!$1macro OWN_$2_PROCESS");
+  for (const [theirs, ours] of [
+    ["FIND_PROCESS", "OWN_FIND_PROCESS"],
+    ["KILL_PROCESS", "OWN_KILL_PROCESS"],
+    ["_CHECK_APP_RUNNING", "OWN_CHECK_APP_RUNNING"],
+  ]) {
+    assert.equal(
+      macro(include, ours),
+      own(macro(template, theirs)),
+      `electron-builder changed ${theirs}: carry the change over to ${ours} in resources/installer.nsh`,
+    );
+  }
 });

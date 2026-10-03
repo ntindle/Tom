@@ -8,7 +8,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { UPDATES_OFF, appEnvironment, dataDirOverride, installDirOverride, kind } from "./config";
+import { UPDATES_OFF, appEnvironment, dataDirOverride, installDirOverride, kind, product } from "./config";
 import { isUnder, listProcesses, type RunningProcess } from "./processes";
 
 const INSTALL_TIMEOUT_MS = 40 * 60_000;
@@ -43,7 +43,7 @@ class WindowsInstall implements Platform {
   // Per-user and one-click (electron-builder.config.js `nsis`): no elevation, no questions.
   private readonly dir =
     installDirOverride ||
-    path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local"), "Programs", "autogpt");
+    path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local"), "Programs", product.packageName);
 
   async install(artifact: string): Promise<Notes> {
     // /S installs without starting the app afterwards. /D must come last.
@@ -62,7 +62,7 @@ class WindowsInstall implements Platform {
   }
 
   executable(): string {
-    return path.join(this.dir, "AutoGPT.exe");
+    return path.join(this.dir, `${product.productFilename}.exe`);
   }
 
   runtimeDir(): string {
@@ -80,7 +80,7 @@ class WindowsInstall implements Platform {
   async uninstall(): Promise<void> {
     // The uninstaller copies itself to a temporary directory and returns
     // before the copy has finished the work.
-    await run(path.join(this.dir, "Uninstall AutoGPT.exe"), ["/S"], { timeoutMs: INSTALL_TIMEOUT_MS });
+    await run(path.join(this.dir, `Uninstall ${product.productFilename}.exe`), ["/S"], { timeoutMs: INSTALL_TIMEOUT_MS });
     await waitUntil(() => !fs.existsSync(this.dir), INSTALL_TIMEOUT_MS, `${this.dir} to be removed`);
   }
 
@@ -90,7 +90,7 @@ class WindowsInstall implements Platform {
 }
 
 class MacInstall implements Platform {
-  private readonly app = installDirOverride || "/Applications/AutoGPT.app";
+  private readonly app = installDirOverride || `/Applications/${product.productFilename}.app`;
 
   async install(artifact: string): Promise<Notes> {
     // Mark the image as a browser download would, so that what is recorded
@@ -102,7 +102,7 @@ class MacInstall implements Platform {
     try {
       // Dragging onto an existing app replaces it; ditto alone would merge.
       fs.rmSync(this.app, { recursive: true, force: true });
-      await run("ditto", [path.join(mount, "AutoGPT.app"), this.app], { timeoutMs: INSTALL_TIMEOUT_MS });
+      await run("ditto", [path.join(mount, `${product.productFilename}.app`), this.app], { timeoutMs: INSTALL_TIMEOUT_MS });
     } finally {
       await run("hdiutil", ["detach", mount, "-force"], { check: false });
     }
@@ -129,7 +129,7 @@ class MacInstall implements Platform {
   }
 
   executable(): string {
-    return path.join(this.app, "Contents", "MacOS", "AutoGPT");
+    return path.join(this.app, "Contents", "MacOS", product.productFilename);
   }
 
   runtimeDir(): string {
@@ -185,7 +185,8 @@ abstract class LinuxInstall {
 }
 
 class DebInstall extends LinuxInstall implements Platform {
-  private readonly dir = "/opt/AutoGPT";
+  // electron-builder installs under the product's name, not the package's.
+  private readonly dir = `/opt/${product.productName}`;
 
   async install(artifact: string): Promise<Notes> {
     await run(
@@ -193,7 +194,7 @@ class DebInstall extends LinuxInstall implements Platform {
       ["-n", "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y", path.resolve(artifact)],
       { timeoutMs: INSTALL_TIMEOUT_MS },
     );
-    const version = await run("dpkg-query", ["-W", "-f=${Version}", "autogpt"]);
+    const version = await run("dpkg-query", ["-W", "-f=${Version}", product.packageName]);
     return { "package version": version.output.trim() };
   }
 
@@ -206,7 +207,7 @@ class DebInstall extends LinuxInstall implements Platform {
   }
 
   executable(): string {
-    return path.join(this.dir, "autogpt");
+    return path.join(this.dir, product.packageName);
   }
 
   runtimeDir(): string {
@@ -218,7 +219,7 @@ class DebInstall extends LinuxInstall implements Platform {
   }
 
   async uninstall(): Promise<void> {
-    await run("sudo", ["-n", "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "remove", "-y", "autogpt"], {
+    await run("sudo", ["-n", "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "remove", "-y", product.packageName], {
       timeoutMs: INSTALL_TIMEOUT_MS,
     });
   }
@@ -227,7 +228,7 @@ class DebInstall extends LinuxInstall implements Platform {
 class AppImageInstall extends LinuxInstall implements Platform {
   private readonly file = path.join(
     installDirOverride || path.join(os.homedir(), "Applications"),
-    "AutoGPT.AppImage",
+    `${product.artifactBase}.AppImage`,
   );
 
   async install(artifact: string): Promise<Notes> {
@@ -253,17 +254,14 @@ class AppImageInstall extends LinuxInstall implements Platform {
 
   runtimeDir(): string {
     for (const found of listProcesses()) {
-      const match = MOUNTED.exec(found.executable);
-      if (match) {
-        const mount = found.executable.slice(0, match.index + 1 + match[1].length);
-        return path.join(mount, "resources", "runtime");
-      }
+      const mount = ownMount(found.executable);
+      if (mount) return path.join(mount, "resources", "runtime");
     }
     throw new Error("the AppImage is not running, so its runtime is not mounted");
   }
 
   owns(found: RunningProcess): boolean {
-    return found.executable === this.file || MOUNTED.test(found.executable);
+    return found.executable === this.file || ownMount(found.executable) !== null;
   }
 
   async uninstall(): Promise<void> {
@@ -282,8 +280,15 @@ class AppImageInstall extends LinuxInstall implements Platform {
 }
 
 // The AppImage runtime mounts the image at <tmp>/.mount_<first six letters
-// of the file name><random>; the app's processes run from there.
-const MOUNTED = /\/(\.mount_AutoGP[^/]*)\//;
+// of the file name><random>; the app's processes run from there. Those six
+// letters are the same for the normal app and for every variant, so a mount
+// is this app's only if the executable in it is.
+const MOUNTED = /^(.*\/\.mount_[^/]+)\//;
+
+function ownMount(executable: string): string | null {
+  const mount = MOUNTED.exec(executable)?.[1];
+  return mount && fs.existsSync(path.join(mount, product.packageName)) ? mount : null;
+}
 
 function create(): Platform {
   if (kind === "nsis") return new WindowsInstall();

@@ -11,6 +11,9 @@ Routing is the appliance's:
 Responses are streamed chunk by chunk so AutoPilot's server-sent events reach
 the browser as they are produced, and bodies are passed through still
 compressed.
+
+Cookies are kept apart from those of other installs of the app on the same
+machine, which a browser would otherwise mix up (cookies.py).
 """
 
 from __future__ import annotations
@@ -22,6 +25,8 @@ from dataclasses import dataclass
 
 import aiohttp
 from aiohttp import web
+
+from autogpt_desktop import cookies, install
 
 HOP_BY_HOP = {
     "connection",
@@ -44,6 +49,7 @@ MAX_BODY = 256 * 1024 * 1024
 
 UPSTREAMS: web.AppKey[Upstreams] = web.AppKey("upstreams")
 CLIENT: web.AppKey[aiohttp.ClientSession] = web.AppKey("client")
+COOKIE_MARK: web.AppKey[str] = web.AppKey("cookie_mark")
 
 
 @dataclass(frozen=True)
@@ -54,9 +60,10 @@ class Upstreams:
     frontend: str
 
 
-def build_app(upstreams: Upstreams) -> web.Application:
+def build_app(upstreams: Upstreams, install_name: str | None = None) -> web.Application:
     app = web.Application(client_max_size=MAX_BODY)
     app[UPSTREAMS] = upstreams
+    app[COOKIE_MARK] = cookies.mark_of(install_name or install.name())
     app.cleanup_ctx.append(_client_session)
     app.router.add_route("*", "/{tail:.*}", _route)
     return app
@@ -107,6 +114,8 @@ async def _http(
                     continue
                 if name.lower() == "location":
                     value = _rewrite_location(value, upstreams, api)
+                if name.lower() == "set-cookie":
+                    value = cookies.to_browser(value, request.app[COOKIE_MARK])
                 response.headers.add(name, value)
             if api:
                 response.headers["X-Accel-Buffering"] = "no"
@@ -164,13 +173,24 @@ def _forward_headers(request: web.Request, upstreams: Upstreams) -> dict[str, st
     headers = {
         name: value
         for name, value in request.headers.items()
-        if name.lower() not in HOP_BY_HOP
+        if name.lower() not in HOP_BY_HOP and name.lower() != "cookie"
     }
+    if cookie := _own_cookies(request):
+        headers["Cookie"] = cookie
     headers["Host"] = public_host
     headers["X-Forwarded-For"] = request.remote or "127.0.0.1"
     headers["X-Forwarded-Proto"] = upstreams.public_url.split("://", 1)[0]
     headers["X-Forwarded-Host"] = public_host
     return headers
+
+
+def _own_cookies(request: web.Request) -> str | None:
+    """The cookies of this install among those the browser sent: it sends
+    every install's, since they are all on 127.0.0.1 (cookies.py)."""
+    sent = request.headers.getall("Cookie", [])
+    if not sent:
+        return None
+    return cookies.to_platform("; ".join(sent), request.app[COOKIE_MARK])
 
 
 def _rewrite_location(value: str, upstreams: Upstreams, api: bool) -> str:

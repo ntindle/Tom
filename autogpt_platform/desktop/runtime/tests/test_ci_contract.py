@@ -60,6 +60,20 @@ def test_the_caller_workflow_hands_its_commit_to_the_build_on_main():
     assert "secrets:" not in workflow, "unsigned builds need no secrets; pass none"
 
 
+def test_the_caller_workflow_says_which_branch_the_commit_belongs_to():
+    """The build on main reads a variant's slug from `variant/<slug>`. Without
+    the branch, a variant's commit would be built as the normal app, which
+    opens the normal app's data (README, "Variants")."""
+    workflow = CALLER.read_text("utf-8")
+    assert re.search(
+        r"^\s+branch: \$\{\{ github\.base_ref \|\| github\.ref_name \}\}$", workflow, re.M
+    ), "hand the build the branch: the target of a pull request, else the branch pushed to"
+    assert re.search(r'^\s+branches: \[desktop, "variant/\*\*"\]$', workflow, re.M), (
+        "pushes to desktop and to every variant branch are built"
+    )
+    assert "variant:" not in workflow, "no slug is written down here: one file serves every variant"
+
+
 def test_every_path_that_triggers_the_build_exists():
     """A path filter naming a file upstream renamed never triggers again."""
     paths = re.findall(r'^\s+- "([^"]+)"$', CALLER.read_text("utf-8"), re.M)
