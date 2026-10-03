@@ -21,13 +21,14 @@ const readline = require("node:readline");
 const STOP_GRACE_MS = 20_000;
 
 class Runtime extends EventEmitter {
-  constructor({ command, args = [], env = {}, cwd, logFile }) {
+  constructor({ command, args = [], env = {}, cwd, logFile, registryFile }) {
     super();
     this.command = command;
     this.args = args;
     this.env = env;
     this.cwd = cwd;
     this.logFile = logFile;
+    this.registryFile = registryFile;
     this.child = null;
     this.stopping = false;
     this.exited = null;
@@ -71,9 +72,32 @@ class Runtime extends EventEmitter {
     if (!this.child || this.child.exitCode !== null) return;
     this.stopping = true;
     this.child.stdin.end();
-    const timer = setTimeout(() => this.child.kill("SIGKILL"), STOP_GRACE_MS);
+    const timer = setTimeout(() => {
+      this.child.kill("SIGKILL");
+      killRecorded(this.registryFile);
+    }, STOP_GRACE_MS);
     await this.exited;
     clearTimeout(timer);
+  }
+}
+
+// A runtime that had to be killed cannot stop its services. It keeps a list
+// of them on disk for exactly this case (Windows also has a Job Object that
+// takes them down with it; other systems rely on this).
+function killRecorded(registryFile) {
+  if (!registryFile) return;
+  let entries;
+  try {
+    entries = JSON.parse(fs.readFileSync(registryFile, "utf8"));
+  } catch {
+    return;
+  }
+  for (const entry of Array.isArray(entries) ? entries : []) {
+    try {
+      process.kill(entry.pid, "SIGKILL");
+    } catch {
+      // already gone
+    }
   }
 }
 
@@ -87,4 +111,4 @@ function parseEvent(line) {
   }
 }
 
-module.exports = { Runtime, parseEvent };
+module.exports = { Runtime, parseEvent, killRecorded };

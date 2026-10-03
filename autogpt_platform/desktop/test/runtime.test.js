@@ -6,7 +6,8 @@ const os = require("node:os");
 const path = require("node:path");
 const { test } = require("node:test");
 
-const { Runtime, parseEvent } = require("../src/runtime");
+const { spawn } = require("node:child_process");
+const { Runtime, parseEvent, killRecorded } = require("../src/runtime");
 const { defaultDataDir, readRuntimeManifest } = require("../src/paths");
 
 const FAKE = path.join(__dirname, "fake-runtime.js");
@@ -109,4 +110,16 @@ test("manifest commands resolve relative to the runtime directory", () => {
   const mac = readRuntimeManifest(dir, "darwin");
   assert.equal(mac.command, path.join(dir, "python/bin/python3"));
   assert.deepEqual(mac.env, { A: `${dir}/a` });
+});
+
+test("services recorded by a runtime that had to be killed are killed too", async () => {
+  const service = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+  const exited = new Promise((resolve) => service.once("exit", (code, signal) => resolve(signal || code)));
+  const registry = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "agpt-registry-")), "children.json");
+  fs.writeFileSync(registry, JSON.stringify([{ name: "service", pid: service.pid }, { name: "gone", pid: 999999 }]));
+
+  killRecorded(registry);
+
+  assert.ok(await exited);
+  assert.doesNotThrow(() => killRecorded(path.join(os.tmpdir(), "no-such-registry.json")));
 });

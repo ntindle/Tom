@@ -60,16 +60,13 @@ def process(bundle: Bundle, data: DataDir, port: int, password: str) -> ManagedP
     )
 
 
-def wait_ready(port: int, password: str, timeout: float = 60) -> bool:
+def is_ready(port: int, password: str) -> bool:
     import redis
 
-    def answers() -> bool:
-        try:
-            return bool(_client(port, password).ping())
-        except redis.RedisError:
-            return False
-
-    return wait_until(answers, timeout)
+    try:
+        return bool(_client(port, password).ping())
+    except redis.RedisError:
+        return False
 
 
 def ensure_cluster(port: int, password: str, timeout: float = 60) -> None:

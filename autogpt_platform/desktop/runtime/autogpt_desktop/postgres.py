@@ -14,12 +14,7 @@ import sys
 from pathlib import Path
 
 from autogpt_desktop.layout import Bundle, DataDir
-from autogpt_desktop.process import (
-    ManagedProcess,
-    run_tool,
-    send_posix_signal,
-    wait_until,
-)
+from autogpt_desktop.process import ManagedProcess, run_tool, send_posix_signal
 
 CONFIG_MARKER = "# autogpt-desktop"
 
@@ -92,25 +87,22 @@ def process(bundle: Bundle, data: DataDir, port: int) -> ManagedProcess:
     )
 
 
-def wait_ready(port: int, password: str, timeout: float = 120) -> bool:
+def is_ready(port: int, password: str) -> bool:
     import psycopg2
 
-    def accepts_queries() -> bool:
-        try:
-            with psycopg2.connect(
-                host="127.0.0.1",
-                port=port,
-                user="postgres",
-                password=password,
-                dbname="postgres",
-                connect_timeout=3,
-            ) as connection:
-                connection.cursor().execute("SELECT 1")
-            return True
-        except psycopg2.Error:
-            return False
-
-    return wait_until(accepts_queries, timeout)
+    try:
+        connection = psycopg2.connect(
+            host="127.0.0.1",
+            port=port,
+            user="postgres",
+            password=password,
+            dbname="postgres",
+            connect_timeout=3,
+        )
+    except psycopg2.Error:
+        return False
+    connection.close()
+    return True
 
 
 def _pg_ctl_stop(bundle: Bundle, data: DataDir):

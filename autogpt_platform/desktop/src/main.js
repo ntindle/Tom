@@ -55,6 +55,7 @@ function startRuntime() {
       AUTOGPT_DESKTOP_SHELL_VERSION: app.getVersion(),
     },
     logFile: path.join(logsDir, "runtime.log"),
+    registryFile: path.join(dataDir, "run", "children.json"),
   });
   runtime.on("event", onRuntimeEvent);
   runtime.on("exit", ({ code, expected }) => {

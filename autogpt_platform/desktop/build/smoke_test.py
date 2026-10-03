@@ -29,9 +29,14 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("runtime", type=Path)
     parser.add_argument("--timeout", type=int, default=600)
+    parser.add_argument(
+        "--data-dir",
+        type=Path,
+        help="use this (empty) data directory, e.g. one with a space in its path",
+    )
     args = parser.parse_args()
     runtime = args.runtime.resolve()
-    data = Path(tempfile.mkdtemp(prefix="autogpt-smoke-"))
+    data = args.data_dir or Path(tempfile.mkdtemp(prefix="autogpt-smoke-"))
 
     started = time.monotonic()
     process = subprocess.Popen(
@@ -62,9 +67,13 @@ def main() -> int:
     time.sleep(2)
     leftovers = processes_from(runtime)
     if leftovers:
-        failures.append(f"processes left running: {sorted(set(leftovers))}")
-        for name in sorted(set(leftovers)):
-            print(f"  leftover: {name}")
+        names = sorted({leftover.info["name"] for leftover in leftovers})
+        failures.append(f"processes left running: {names}")
+        for leftover in leftovers:  # do not leave the machine dirty
+            try:
+                leftover.kill()
+            except psutil.Error:
+                pass
 
     if failures:
         print("\nFAILED")
@@ -127,8 +136,8 @@ def fetch_status(url: str) -> int | str:
         return str(exc)
 
 
-def processes_from(runtime: Path) -> list[str]:
-    """Names of running processes whose executable lives in the bundle."""
+def processes_from(runtime: Path) -> list[psutil.Process]:
+    """Running processes whose executable lives in the bundle."""
     root = os.path.normcase(os.path.realpath(runtime))
     found = []
     for process in psutil.process_iter(["pid", "name", "exe"]):
@@ -138,7 +147,7 @@ def processes_from(runtime: Path) -> list[str]:
         if not executable:
             continue
         if os.path.normcase(os.path.realpath(executable)).startswith(root + os.sep):
-            found.append(process.info["name"])
+            found.append(process)
     return found
 
 

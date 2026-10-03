@@ -20,6 +20,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from typing import NoReturn
 
 from autogpt_desktop import (
@@ -122,13 +123,21 @@ class Stack:
         for process in (database, cache, queue):
             self.launch(process)
 
-        self.require(
-            postgres.wait_ready(port["postgres"], secret["POSTGRES_PASSWORD"]), database
+        self.await_ready(
+            database,
+            lambda: postgres.is_ready(port["postgres"], secret["POSTGRES_PASSWORD"]),
+            timeout=120,
         )
-        self.require(valkey.wait_ready(port["valkey"], secret["REDIS_PASSWORD"]), cache)
+        self.await_ready(
+            cache,
+            lambda: valkey.is_ready(port["valkey"], secret["REDIS_PASSWORD"]),
+            timeout=60,
+        )
         valkey.ensure_cluster(port["valkey"], secret["REDIS_PASSWORD"])
-        self.require(
-            rabbitmq.wait_ready(port["rabbitmq"], rabbit_user, rabbit_password), queue
+        self.await_ready(
+            queue,
+            lambda: rabbitmq.is_ready(port["rabbitmq"], rabbit_user, rabbit_password),
+            timeout=240,
         )
 
     def migrate(
@@ -174,15 +183,26 @@ class Stack:
         self.processes.append(process)
         self.registry.record(self.processes)
 
-    def require(self, became_ready: bool, process: ManagedProcess) -> None:
+    def await_ready(
+        self, process: ManagedProcess, probe: Callable[[], bool], timeout: float
+    ) -> None:
+        """Wait for a service to answer, but not past the point of knowing it
+        never will: a process that has exited, or a stop request, ends the
+        wait at once instead of running out the timeout."""
+
+        def settled() -> bool:
+            if self.stop_requested.is_set() or process.exit_code() is not None:
+                return True
+            return probe()
+
+        wait_until(settled, timeout)
         if self.stop_requested.is_set():
             raise StartupError("startup was cancelled")
-        if became_ready:
-            return
         log = self.data.logs / f"{process.name}.log"
-        raise StartupError(
-            f"{process.name} did not start. See {log} for details."
-        )
+        if process.exit_code() is not None:
+            raise StartupError(f"{process.name} exited while starting. See {log} for details.")
+        if not probe():
+            raise StartupError(f"{process.name} did not start. See {log} for details.")
 
     def wait_for_apps(self, port: dict[str, int]) -> None:
         probes = {

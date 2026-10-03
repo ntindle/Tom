@@ -9,14 +9,16 @@ Erlang installation on the machine.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import secrets
 import sys
+import tempfile
 from pathlib import Path
 
-from autogpt_desktop.layout import EXE, Bundle, DataDir
-from autogpt_desktop.process import ManagedProcess, run_tool, wait_until
+from autogpt_desktop.layout import EXE, SCRIPT, Bundle, DataDir
+from autogpt_desktop.process import ManagedProcess, run_tool
 
 NODE_NAME = "rabbit@localhost"
 INETRC_NAME = "erl_inetrc"
@@ -109,7 +111,7 @@ def process(bundle: Bundle, data: DataDir, ports: dict[str, int]) -> ManagedProc
     env = environment(bundle, data, ports)
     return ManagedProcess(
         name="rabbitmq",
-        argv=[str(bundle.rabbitmq_script("rabbitmq-server"))],
+        argv=[_script(bundle, "rabbitmq-server")],
         env=env,
         cwd=data.rabbitmq,
         log_dir=data.logs,
@@ -118,7 +120,7 @@ def process(bundle: Bundle, data: DataDir, ports: dict[str, int]) -> ManagedProc
     )
 
 
-def wait_ready(port: int, user: str, password: str, timeout: float = 240) -> bool:
+def is_ready(port: int, user: str, password: str) -> bool:
     import pika
     import pika.exceptions
 
@@ -133,48 +135,65 @@ def wait_ready(port: int, user: str, password: str, timeout: float = 240) -> boo
         socket_timeout=3,
         blocked_connection_timeout=3,
     )
-
-    def accepts_logins() -> bool:
-        try:
-            pika.BlockingConnection(parameters).close()
-            return True
-        except pika.exceptions.AMQPError:
-            return False
-
-    return wait_until(accepts_logins, timeout, interval=1)
+    try:
+        pika.BlockingConnection(parameters).close()
+        return True
+    except pika.exceptions.AMQPError:
+        return False
 
 
 def _stop(bundle: Bundle, env: dict[str, str]) -> None:
-    _ctl(bundle, env, "stop")
-    # Erlang leaves its port mapper daemon running after the node exits.
-    epmd = next(bundle.erlang_home.glob(f"erts-*/bin/epmd{EXE}"), None)
-    if epmd:
-        run_tool(
-            [str(epmd), "-kill"],
-            env=env,
-            capture_output=True,
-            timeout=10,
-        )
-
-
-def _ctl(bundle: Bundle, env: dict[str, str], *args: str) -> None:
     run_tool(
-        [str(bundle.rabbitmq_script("rabbitmqctl")), "-n", NODE_NAME, *args],
+        [_script(bundle, "rabbitmqctl"), "-n", NODE_NAME, "stop"],
         env=env,
         capture_output=True,
         timeout=25,
     )
+    # Erlang leaves its port mapper daemon running after the node exits.
+    epmd = next(bundle.erlang_home.glob(f"erts-*/bin/epmd{EXE}"), None)
+    if epmd:
+        run_tool([str(epmd), "-kill"], env=env, capture_output=True, timeout=10)
+
+
+def _script(bundle: Bundle, name: str) -> str:
+    # Through the space-free alias: the scripts locate each other from $0.
+    return str(Path(_short(bundle.rabbitmq_home)) / "sbin" / f"{name}{SCRIPT}")
 
 
 def _short(path: Path) -> str:
-    """RabbitMQ's Windows batch scripts and Erlang both stumble over spaces and
-    non-ASCII characters, and %LOCALAPPDATA% contains the user's name. The
-    8.3 alias of the same directory has neither."""
-    if not WINDOWS:
+    """A spelling of `path` with no spaces in it.
+
+    RabbitMQ's launch scripts (batch on Windows, sh elsewhere) source and
+    execute unquoted paths, and both the bundle and the data directory
+    normally contain a space or the user's name: `%LOCALAPPDATA%` on Windows,
+    `~/Library/Application Support` on macOS.
+    """
+    path.mkdir(parents=True, exist_ok=True)
+    if WINDOWS:
+        return _windows_short_name(path)
+    if not any(character.isspace() for character in str(path)):
         return str(path)
+    return str(_symlink_alias(path))
+
+
+def _windows_short_name(path: Path) -> str:
+    """The 8.3 alias of the directory, which has neither spaces nor
+    non-ASCII characters."""
     import ctypes
 
-    path.mkdir(parents=True, exist_ok=True)
     buffer = ctypes.create_unicode_buffer(32768)
     length = ctypes.windll.kernel32.GetShortPathNameW(str(path), buffer, len(buffer))
     return buffer.value if 0 < length < len(buffer) else str(path)
+
+
+def _symlink_alias(path: Path) -> Path:
+    """A symlink to `path` in a per-user temp directory, whose own path
+    (/tmp, or /var/folders/... on macOS) has no spaces."""
+    root = Path(tempfile.gettempdir()) / f"autogpt-desktop-{os.getuid()}"
+    root.mkdir(mode=0o700, exist_ok=True)
+    link = root / hashlib.sha256(str(path).encode()).hexdigest()[:16]
+    if link.is_symlink() and Path(os.readlink(link)) != path:
+        link.unlink()
+    if not link.is_symlink():
+        link.symlink_to(path, target_is_directory=True)
+    return link
