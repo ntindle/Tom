@@ -203,7 +203,7 @@ class Build:
         # A flat node_modules: pnpm's default symlink farm does not survive
         # being copied into an installer (Windows junctions store absolute
         # paths, and symlinks need elevation to create).
-        pnpm = _pnpm()
+        pnpm = self._pnpm(env)
         run(
             [
                 *pnpm,
@@ -228,6 +228,20 @@ class Build:
         shutil.rmtree(target / ".next" / "cache", ignore_errors=True)
         # webpack's build cache is several GB and only speeds up a rebuild.
         shutil.rmtree(frontend / ".next" / "cache", ignore_errors=True)
+
+    def _pnpm(self, env: dict[str, str]) -> list[str]:
+        if WINDOWS:
+            # pnpm on Windows is a .cmd/.ps1 shim, which CreateProcess cannot run.
+            return ["cmd", "/c", "pnpm"]
+        if shutil.which("pnpm"):
+            return ["pnpm"]
+        # No pnpm installed: the pinned Node distribution that step_node
+        # unpacked carries corepack, which fetches the pnpm version the
+        # frontend's package.json names.
+        node_bin = self.cache / "node-dist" / "bin"
+        env["PATH"] = os.pathsep.join([str(node_bin), env["PATH"]])
+        env["COREPACK_ENABLE_DOWNLOAD_PROMPT"] = "0"
+        return [str(node_bin / "corepack"), "pnpm"]
 
     # --- glue -------------------------------------------------------------
 
@@ -404,13 +418,6 @@ def _single(paths) -> Path:
     if len(found) != 1:
         raise RuntimeError(f"expected exactly one match, found {found}")
     return found[0]
-
-
-def _pnpm() -> list[str]:
-    if WINDOWS:
-        # pnpm on Windows is a .cmd/.ps1 shim, which CreateProcess cannot run.
-        return ["cmd", "/c", "pnpm"]
-    return ["pnpm"]
 
 
 def _add_msvc_runtime(erlang: Path) -> None:
