@@ -61,7 +61,8 @@ file. See [What a sync push can start](#what-a-sync-push-can-start).
 | Workflow (on `main`) | Trigger | What it does |
 | --- | --- | --- |
 | `sync-upstream.yml` | Daily at 05:23 UTC, or by hand | Merges upstream `dev` into `desktop` if the merge is clean and the tests pass; otherwise reports in the `upstream-sync` issue. |
-| `desktop-build.yml` | Never by itself. It is started (1) by the sync after a push, (2) by hand, (3) by `desktop-nightly.yml`, and (4) by the caller workflow on `desktop` for pull requests into `desktop` and for pushes to `desktop` that change the desktop app's files. | Builds and tests the installers from the commit it is given. |
+| `desktop-build.yml` | Never by itself. It is started (1) by the sync after a push, (2) by hand, (3) by `desktop-nightly.yml`, (4) by the caller workflow on `desktop` for pull requests into `desktop` and for pushes to `desktop` that change the desktop app's files, and (5) by `desktop-release.yml`. | Builds and tests the installers from the commit it is given. Only (5) signs or names a version; every other build is `0.0.0-dev.<run number>`, which never looks for updates. |
+| `desktop-release.yml` | By hand only | Builds a commit of `desktop` with a version, signs it with whatever certificates the `desktop-release` environment holds, runs the installed-app tests, and publishes a GitHub Release. See [Cutting a release](#cutting-a-release). |
 | `desktop-nightly.yml` | Daily at 04:23 UTC | Calls `desktop-build.yml` for `desktop` with the installed-app tests switched on: the installers are installed, run, upgraded and removed on fresh Windows, macOS and Linux machines. This is the most expensive job in the repository. |
 | `build-report.yml` | When a build of `desktop` finishes | Puts a failed build into the `upstream-sync` issue and closes it again after a green one. |
 | `main-checks.yml` | Pull requests and pushes to `main` | Tests `scripts/` and lints the workflows. |
@@ -175,7 +176,7 @@ them.
 
    Expected active entries: the files in `main`'s `.github/workflows`
    (`sync-upstream.yml`, `desktop-build.yml`, `desktop-nightly.yml`,
-   `build-report.yml`, `main-checks.yml`),
+   `desktop-release.yml`, `build-report.yml`, `main-checks.yml`),
    `.github/workflows/platform-desktop-build.yml`, and entries whose path
    starts with `dynamic/` (GitHub's own, such as Dependabot updates).
 
@@ -461,24 +462,313 @@ if such a run ever appears.
 
 ## Cutting a release
 
-> **PLACEHOLDER. The release workflow does not exist yet.** This section
-> states the rules it must follow. Replace it with the real procedure when the
-> workflow is written.
+A release is a GitHub Release of this repository named `desktop-v<version>`.
+It is what people download and what installed apps update themselves from:
+an app asks GitHub for the **latest** release, reads `latest.yml`,
+`latest-mac.yml` or `latest-linux.yml` from it, and accepts the installer
+named there if its SHA-512 matches. `desktop-release.yml` is the only thing
+that creates one. Do not create, edit or re-upload a release by hand, and do
+not publish any other kind of release in this repository: whatever GitHub
+marks as latest is what every installed app moves to.
 
-- Tag releases as `desktop-v<version>` **on a commit of `main`**, never on
+### The rules
+
+- The tag is `desktop-v<version>` **on a commit of `main`**, never on
   `desktop`. GitHub runs `on: release` workflows from the tagged commit. A tag
   on `desktop` carries upstream's release workflows
   (`platform-single-container-docker`, `platform-autogpt-deploy-prod`,
   `classic-autogpt-docker-release`) and publishing the release would start
-  them. A tag on `main` carries only the fork's workflows.
-- The tag only anchors the release page and its installers. Record the
-  `desktop` commit SHA the installers were built from in the release notes.
-- Release only from a `desktop` commit whose `desktop-build.yml` run is green
-  on all three platforms.
-- The `desktop-v` prefix keeps the fork's tags apart from upstream's. The sync
-  fetches upstream with `--no-tags`, so upstream's tags never arrive here.
-- If the release workflow needs a secret, store it in an environment that only
-  admits `main`, as for the sync token.
+  them. A tag on `main` carries only the fork's workflows. The workflow puts
+  the tag on the commit of `main` it was started from; the release notes
+  record the `desktop` commit the installers were built from.
+- The `desktop-v` prefix keeps the fork's tags apart from upstream's
+  (`v0.4.7` and the like are upstream's and are in this repository).
+- A version is released once. If a release is bad, the next one has a higher
+  version (see [Taking a bad release back](#taking-a-bad-release-back)).
+- The version is given when the workflow is started. Nothing in the
+  repository is edited for a release: `package.json` on `desktop` always says
+  `0.0.0-dev.0`.
+- `1.2.3` is a full release. `1.3.0-rc.1` (anything with a `-` part) must be
+  started as a pre-release: it gets a release page for manual testing and no
+  installed app is offered it. There is one update channel.
+- No leading zeros: `1.2.03` and `1.3.0-rc.01` are refused. The updater in
+  an installed app reads versions strictly and would not accept them.
+
+### Once: the signing environment
+
+The certificates live in a GitHub environment named `desktop-release` that
+only `main` may use, for the same reason as the sync token (see
+[Where the token is stored, and why](#where-the-token-is-stored-and-why)):
+`desktop` carries upstream's workflow files unreviewed, and a repository
+secret can be read by any of them. Create the environment before the first
+release, also when there is no certificate yet. The workflow refuses to start
+if it is missing or admits another branch.
+
+```bash
+gh api -X PUT repos/ntindle/autogpt/environments/desktop-release \
+  -F 'deployment_branch_policy[protected_branches]=false' \
+  -F 'deployment_branch_policy[custom_branch_policies]=true'
+gh api -X POST repos/ntindle/autogpt/environments/desktop-release/deployment-branch-policies \
+  -f name=main -f type=branch
+gh api repos/ntindle/autogpt/environments/desktop-release/deployment-branch-policies \
+  -q '.branch_policies[] | .type + ":" + .name'      # must print exactly: branch:main
+```
+
+What gets signed depends only on which secrets are in that environment.
+Adding them is the whole of "turning signing on"; no file changes.
+
+| In the environment | macOS | Windows |
+| --- | --- | --- |
+| nothing | ad-hoc signature: Gatekeeper refuses the first launch until it is allowed in System Settings; the app cannot update itself and shows a link instead | unsigned: SmartScreen warns; updates are checked by SHA-512 only |
+| the five Apple secrets | Developer ID signature, hardened runtime, notarized, stapled; updates itself | as above |
+| Windows secrets as well | as above | signed; an update must also carry the same publisher's signature |
+
+A set that is only partly there fails the run at the job `Signing gate`,
+before anything is built, and the error names what is missing. That is every
+partial combination: a certificate without its password or without the
+notarization key, the notarization key without a certificate, one or two of
+the three Azure secrets, the Azure secrets without the four variables or the
+reverse, a password without its certificate. The gate also refuses a secret
+named `CSC_LINK`, `CSC_KEY_PASSWORD` or `APPLE_API_KEY` in the environment:
+those are electron-builder's own names, which nothing here reads, and a
+certificate stored under one would be left unused without a word. What the
+gate cannot see is a secret under any other wrong name: after adding secrets,
+read the gate's summary in the next run. It says, for macOS and for Windows,
+what will be signed. Linux packages are not signed.
+
+Where the secrets go during a run. Three jobs of `desktop-build.yml` matter:
+
+| Job | In the environment | What it runs |
+| --- | --- | --- |
+| `Signing gate` | yes | Its own few lines, which ask whether each secret exists. No checkout. |
+| `Build` | **no** | Everything that is other people's code: the frontend's and backend's dependencies with their install scripts, the compilers, the stack in the smoke test. It packages the systems nobody signs. |
+| `Sign` | yes | Only for a system that has a certificate. Takes the runtime `Build` assembled as an archive (data: it is copied and signed, never run), installs the packaging tools without their install scripts, restores no cache, and runs electron-builder and `build/mac_sign.js`. |
+
+A step of a job can read whatever an earlier step of the same job left
+behind, so "only the packaging step gets the secret" would protect nothing
+if the build ran in the same job. That is why they are separate jobs, and
+`scripts/tests/test_workflows.py` keeps them so. What the `Sign` job does
+trust: the `desktop` commit being released (its `electron-builder.config.js`
+and `build/mac_sign.js`), and the packages in its `package-lock.json`.
+
+Every secret and variable, and nothing else, goes in with
+`--env desktop-release`. Check with:
+
+```bash
+gh secret list --repo ntindle/autogpt                          # must list none of the names below
+gh secret list --repo ntindle/autogpt --env desktop-release
+gh variable list --repo ntindle/autogpt --env desktop-release
+```
+
+#### Apple: the Developer ID certificate
+
+Two secrets: `MAC_CSC_LINK` (the certificate and its private key as a
+base64-encoded `.p12`) and `MAC_CSC_KEY_PASSWORD` (the password of that
+`.p12`). You do this yourself on the Mac that has the certificate; nobody
+else needs to see the file.
+
+1. Open **Keychain Access**, the **login** keychain, **My Certificates**.
+   Find `Developer ID Application: <name> (<team id>)`. If several have that
+   name, pick the one whose SHA-1 is the identity you sign with:
+
+   ```bash
+   security find-identity -v -p codesigning     # lists each identity with its SHA-1
+   ```
+
+   In Keychain Access, **Get Info** on a certificate shows the same SHA-1
+   under Fingerprints. The entry must open to show a private key under it.
+2. Select that one entry (the certificate, with its key), **File > Export
+   Items**, format **Personal Information Exchange (.p12)**, and give it a
+   long password that you use nowhere else. Exactly one identity may be in
+   the file: the build signs with the first Developer ID it finds in it.
+3. Store both, then delete the file:
+
+   ```bash
+   base64 -i DeveloperID.p12 | gh secret set MAC_CSC_LINK --env desktop-release --repo ntindle/autogpt
+   gh secret set MAC_CSC_KEY_PASSWORD --env desktop-release --repo ntindle/autogpt   # paste the .p12 password at the prompt
+   rm DeveloperID.p12
+   ```
+
+Before the first signed release, rehearse on that Mac. This signs a copy of
+a built app exactly as the workflow will and lists every file Apple would
+refuse; it does not notarize and uploads nothing. It needs a built app,
+which takes about an hour the first time (the build is described in
+`autogpt_platform/desktop/README.md`, "Building"; it needs `uv` and Node):
+
+```bash
+# in a checkout of `desktop`, in Terminal on the Mac (not over SSH)
+cd autogpt_platform/desktop
+uv run --python 3.13 --no-project build/build_runtime.py        # assembles build/runtime
+npm ci
+CSC_IDENTITY_AUTO_DISCOVERY=false \
+  npx electron-builder --config electron-builder.config.js --publish never   # writes dist/mac-arm64/AutoGPT.app
+bash build/sign_check_macos.sh <SHA-1 of the identity>          # must end with PASSED
+```
+
+To rehearse on an app that is somewhere else (one unpacked from a nightly
+build's disk image, say), give its path as the second argument:
+`bash build/sign_check_macos.sh <SHA-1> /path/to/AutoGPT.app`. `npm ci` is
+needed either way.
+
+#### Apple: the notarization key
+
+Three secrets: `APPLE_API_KEY_P8`, `APPLE_API_KEY_ID`, `APPLE_API_ISSUER`.
+Apple's notary service is called with an App Store Connect API key, not with
+your Apple ID password.
+
+1. Go to <https://appstoreconnect.apple.com/access/integrations/api>, **Team
+   Keys**. The first time, the account holder has to press **Request
+   Access**.
+2. **Generate API Key**, any name, access **Developer**. Download the
+   `AuthKey_<key id>.p8` file: Apple offers it once.
+3. The **Key ID** is in the table; the **Issuer ID** is above it.
+4. Check that the key works, store all three, then delete the file:
+
+   ```bash
+   xcrun notarytool history --key AuthKey_<key id>.p8 --key-id <key id> --issuer <issuer id>   # must answer, not refuse
+   gh secret set APPLE_API_KEY_P8 --env desktop-release --repo ntindle/autogpt < AuthKey_<key id>.p8
+   gh secret set APPLE_API_KEY_ID --env desktop-release --repo ntindle/autogpt --body '<key id>'
+   gh secret set APPLE_API_ISSUER --env desktop-release --repo ntindle/autogpt --body '<issuer id>'
+   rm AuthKey_<key id>.p8
+   ```
+
+To rotate either, repeat its steps. An installed app only updates itself to
+a build signed by the same Apple developer team, so a renewed certificate
+must be issued to the same team.
+
+#### Windows: later, one of two ways
+
+There is no Windows certificate yet. When there is one, add one of these
+sets. If both are present, Azure is used.
+
+- **Azure Trusted Signing** (Artifact Signing). Secrets `AZURE_TENANT_ID`,
+  `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`: an app registration that has the
+  *Trusted Signing Certificate Profile Signer* role on the certificate
+  profile. Variables (not secrets; `gh variable set <name> --env
+  desktop-release --repo ntindle/autogpt --body '<value>'`):
+  `AZURE_SIGN_ENDPOINT` (such as `https://eus.codesigning.azure.net`),
+  `AZURE_SIGN_ACCOUNT` (the signing account's name), `AZURE_SIGN_PROFILE`
+  (the certificate profile's name) and `AZURE_SIGN_PUBLISHER` (the
+  certificate's subject, exactly, such as `CN=Example, O=Example, C=US`;
+  installed apps compare an update's signature with it).
+- **A certificate file.** Secrets `WIN_CSC_LINK` (a base64-encoded `.pfx`)
+  and `WIN_CSC_KEY_PASSWORD`. Only possible for a certificate whose key may
+  leave its hardware; certificates issued since 2023 usually may not, which
+  is why Azure comes first.
+
+A signed app only takes an update whose signature names the publisher it
+was built with. Apps installed from an unsigned release have no publisher to
+compare with, so moving from unsigned to signed needs nothing. Moving later
+to a certificate with a different subject does: apps signed with the old one
+refuse the update and have to be reinstalled by hand. Keep the subject.
+
+### Each time
+
+1. Pick the commit of `desktop`: one for which the `upstream-sync` issue is
+   closed and the **nightly** run is green. The default is the head of
+   `desktop`. A green build is not enough: the release runs the
+   installed-app tests on eight fresh machines and publishes only if every
+   one passes, and only `desktop-nightly.yml` runs those beforehand. A red
+   machine there means hours of building and no release.
+
+   ```bash
+   gh run list --repo ntindle/autogpt --workflow desktop-nightly.yml --limit 1      --json conclusion,createdAt,url      # conclusion must be "success"
+   gh api repos/ntindle/autogpt/commits/desktop -q '.sha + " " + .commit.committer.date'
+   ```
+
+   The nightly builds whatever `desktop` was at 04:23 UTC. If the second
+   command shows a commit newer than that run, the nightly did not test it:
+   start a build with the tests by hand and wait for it to be green.
+
+   ```bash
+   gh workflow run desktop-build.yml --repo ntindle/autogpt --ref main -f ref=desktop -f e2e=true
+   ```
+
+2. Start the release from `main`:
+
+   ```bash
+   gh workflow run desktop-release.yml --repo ntindle/autogpt --ref main \
+     -f version=1.2.3 -f ref=desktop
+   # a pre-release:  -f version=1.3.0-rc.1 -f prerelease=true
+   sleep 10
+   gh run watch --repo ntindle/autogpt "$(gh run list --repo ntindle/autogpt --workflow desktop-release.yml --limit 1 --json databaseId -q '.[0].databaseId')"
+   ```
+
+3. It takes several hours. What it does:
+
+   | Job | What it does |
+   | --- | --- |
+   | Check the request | Refuses a version that is malformed, already tagged, or not higher than the latest release; a commit that `desktop` does not contain; a signing environment that is missing or open to other branches. |
+   | Build | `desktop-build.yml` for that commit, with that version: unit tests, the signing gate, the three builds, the `Sign` job for each system that has a certificate, then the installed-app tests on eight fresh machines. |
+   | Publish | Only if all of that passed. Checks that every file is there and that the update files name the right version and checksums; writes `SHA256SUMS`; records a build-provenance attestation; creates a **draft**; uploads; compares what GitHub stored with what was built; publishes. The tag is created at that last moment. |
+
+4. Look at the release page. The notes say how each system's files are
+   signed. Then check one download as a user would:
+
+   ```bash
+   gh release download desktop-v1.2.3 --repo ntindle/autogpt --dir check && cd check
+   sha256sum --check SHA256SUMS
+   gh attestation verify AutoGPT-Setup-1.2.3-x64.exe --repo ntindle/autogpt
+   ```
+
+   On a Mac, for a signed release: open the disk image from a browser
+   download. It must start without the *Open Anyway* step, and
+   `spctl --assess --type execute -vv /Applications/AutoGPT.app` must say
+   `source=Notarized Developer ID`.
+
+### If the run fails
+
+- **Check the request** failed: it says why. Nothing was built.
+- **Build** failed: nothing was published. Fix `desktop`, start again with
+  the same version. If it was an installed-app test (`Installed app (...)`),
+  see step 1 of [Each time](#each-time): the nightly shows the same failure
+  without a release attempt.
+- **Publish** failed before its last step: there may be a draft, which
+  nobody but you can see and no app reads. *Re-run failed jobs* on the run
+  removes every draft of that version and tries again; the built files are
+  kept for seven days. To give up instead, delete the drafts. A draft has no
+  tag, so it is found in the list, and nothing else is left behind:
+
+  ```bash
+  gh api repos/ntindle/autogpt/releases --paginate \
+    --jq '.[] | select(.draft and .tag_name == "desktop-v1.2.3") | .id' \
+    | while read -r id; do gh api -X DELETE "repos/ntindle/autogpt/releases/${id}"; done
+  ```
+
+### Taking a bad release back
+
+Installed apps never move to a lower version, so a release cannot be undone
+for people who already have it. There are two separate things to do.
+
+1. **Stop it spreading.** Make the previous good release the latest again
+   and mark the bad one as a pre-release. Apps that have not installed it
+   yet then stay where they are, and the download page shows the good one.
+   An app that had already downloaded it stops offering it the next time it
+   looks (within six hours while it runs, and in any case when *Restart to
+   update* is chosen, which looks first). An app without a network at that
+   moment still installs what it downloaded.
+
+   ```bash
+   gh release edit desktop-v1.2.3 --repo ntindle/autogpt --prerelease --latest=false
+   gh release edit desktop-v1.2.2 --repo ntindle/autogpt --latest
+   gh api repos/ntindle/autogpt/releases/latest -q .tag_name      # must print: desktop-v1.2.2
+   ```
+
+   Put a line at the top of the bad release's notes saying what is wrong
+   (`gh release edit desktop-v1.2.3 --notes-file ...`). Do not delete its
+   files: a download that is in progress would fail half way, and the notes
+   are the record. Do not delete or move its tag, and never reuse `1.2.3`.
+
+2. **Fix the people who have it.** Release `1.2.4` from a good commit. That
+   is the only way an installed `1.2.3` changes. If the fix is to go back to
+   the old code, `1.2.4` is built from the old `desktop` commit (the notes of
+   `desktop-v1.2.2` name it): `-f version=1.2.4 -f ref=<that commit>`.
+
+   Going back is safe for the program and not always for the data: a newer
+   version may have migrated the database, and older code then meets a
+   schema it does not know. Before releasing old code as a new version,
+   check `git diff <old commit> <bad commit> -- autogpt_platform/backend/migrations`.
+   If the bad version added migrations, do not go back; fix forward.
 
 ## If scheduled runs stop
 
@@ -523,3 +813,19 @@ them, except where noted:
   job in `desktop-build.yml`.
 - Third-party actions used on `main` are listed in step 3 of
   [Enabling Actions the first time](#enabling-actions-the-first-time).
+- `desktop-release.yml` and `desktop-build.yml` share names with the
+  `desktop` branch, which no test on `main` can see: the installers' file
+  names and the environment variables `AUTOGPT_DESKTOP_VERSION`,
+  `AUTOGPT_DESKTOP_OUTPUT`, `AUTOGPT_DESKTOP_MAC_SIGN` and
+  `AUTOGPT_DESKTOP_WIN_SIGN` come from
+  `autogpt_platform/desktop/electron-builder.config.js`, and
+  `build/mac_sign.js check` is run on the signed macOS app. The release job
+  fails, before anything is published, when a file it expects is missing.
+- Every secret and variable the build reads is named in
+  [Cutting a release](#cutting-a-release). Only the packaging steps of the
+  `sign` job may hold one, and the `build` job is in no environment. The
+  tests also run the gate's script with every partial set of secrets.
+- The version pattern is written three times and must stay the same: in
+  `scripts/release_plan.py`, in the `Version` step of `desktop-build.yml`
+  (the tests run both against one list), and in
+  `electron-builder.config.js` on `desktop`.

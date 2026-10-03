@@ -2,11 +2,32 @@ name: Desktop build
 
 # Builds and tests the desktop app (autogpt_platform/desktop on the `desktop`
 # branch) on clean GitHub-hosted machines. This is the only place that knows
-# how: the `desktop` branch calls it for pull requests and pushes, and
-# desktop-nightly.yml calls it with the installed-app tests switched on.
+# how: the `desktop` branch calls it for pull requests and pushes,
+# desktop-nightly.yml calls it with the installed-app tests switched on, and
+# desktop-release.yml calls it to build what it publishes.
 #
 # The workflow lives on `main` and the code on `desktop`, so every checkout
-# names the ref it is given. Nothing is signed or published here.
+# names the ref it is given. Nothing is published here.
+#
+# Signing. Only desktop-release.yml asks for it (`sign`). The certificates
+# are in the `desktop-release` environment, which admits the branch `main`
+# only: a call from `desktop` that set `sign` would be refused by the
+# environment before a job that names it starts. What is signed depends only
+# on which secrets exist there (docs/MAINTAINING.md, "Cutting a release");
+# with none, the build is the same ad-hoc/unsigned one as for a pull request.
+#
+# Steps of one job share a machine, a user, $GITHUB_ENV and $GITHUB_PATH, so
+# giving a secret to "only the packaging step" keeps it from nothing that ran
+# earlier in that job. The build runs a great deal of other people's code
+# (the frontend's and the backend's dependencies with their install scripts,
+# compilers, the stack itself in the smoke test). So the secrets are kept in
+# other jobs, on other machines:
+#
+#   gate   in the environment; asks which secrets exist and runs nothing else
+#   build  no environment, no secret; assembles, tests, and packages every
+#          leg that nobody signs
+#   sign   in the environment; for a leg with a certificate, takes the
+#          assembled runtime as an archive and only packages and signs it
 
 on:
   workflow_call:
@@ -17,6 +38,18 @@ on:
         default: desktop
       e2e:
         description: Install the built app on fresh machines and test it
+        type: boolean
+        default: false
+      version:
+        description: The app's version. Empty for a development build, 0.0.0-dev.<run number>.
+        type: string
+        default: ""
+      sign:
+        description: Sign with whatever certificates the desktop-release environment holds
+        type: boolean
+        default: false
+      release_files:
+        description: Also upload what a release needs besides the installers (update metadata, the macOS zip)
         type: boolean
         default: false
   workflow_dispatch:
@@ -80,11 +113,133 @@ jobs:
           --with psycopg2-binary --with pika --with psutil --with cryptography
           python -m pytest -q
 
+  # Which certificates exist. The only thing this job does with the
+  # environment's secrets is ask whether each is there; it checks nothing
+  # out and runs nothing but the lines below. A set that is only partly
+  # there fails the run here, before anything is built: a release must not
+  # come out half signed, or unsigned because of a typing mistake.
+  gate:
+    name: Signing gate
+    if: inputs.sign
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: desktop-release
+    outputs:
+      # How the `sign` job signs each system, or empty: nobody signs it.
+      mac: ${{ steps.gate.outputs.mac }}
+      win: ${{ steps.gate.outputs.win }}
+      mac_description: ${{ steps.gate.outputs.mac_description }}
+      win_description: ${{ steps.gate.outputs.win_description }}
+      # The matrix of the `sign` job, as JSON.
+      legs: ${{ steps.gate.outputs.legs }}
+    steps:
+      - name: Signing gate
+        id: gate
+        shell: bash
+        env:
+          HAS_MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK != '' }}
+          HAS_MAC_CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD != '' }}
+          HAS_APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 != '' }}
+          HAS_APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID != '' }}
+          HAS_APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER != '' }}
+          HAS_AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID != '' }}
+          HAS_AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID != '' }}
+          HAS_AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET != '' }}
+          HAS_AZURE_SIGN_ENDPOINT: ${{ vars.AZURE_SIGN_ENDPOINT != '' }}
+          HAS_AZURE_SIGN_ACCOUNT: ${{ vars.AZURE_SIGN_ACCOUNT != '' }}
+          HAS_AZURE_SIGN_PROFILE: ${{ vars.AZURE_SIGN_PROFILE != '' }}
+          HAS_AZURE_SIGN_PUBLISHER: ${{ vars.AZURE_SIGN_PUBLISHER != '' }}
+          HAS_WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK != '' }}
+          HAS_WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD != '' }}
+          # electron-builder's own names. Nothing here reads them, so a
+          # certificate stored under one of them would be silently unused.
+          HAS_CSC_LINK: ${{ secrets.CSC_LINK != '' }}
+          HAS_CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD != '' }}
+          HAS_APPLE_API_KEY: ${{ secrets.APPLE_API_KEY != '' }}
+        run: |
+          refuse() {
+            echo "::error title=Signing is half configured::$1 See docs/MAINTAINING.md, 'Cutting a release'."
+            exit 1
+          }
+          # "all", "none", or the names that are missing from a set that is
+          # partly there.
+          state() {
+            local missing="" present=0 name flag
+            for name in "$@"; do
+              flag="HAS_${name}"
+              if [ "${!flag}" = "true" ]; then
+                present=$((present + 1))
+              else
+                missing="${missing:+${missing}, }${name}"
+              fi
+            done
+            if [ -z "${missing}" ]; then echo all; elif [ "${present}" -eq 0 ]; then echo none; else echo "${missing}"; fi
+          }
+          complete() {
+            local label="$1" found
+            shift
+            found="$(state "$@")"
+            case "${found}" in
+              all) return 0 ;;
+              none) return 1 ;;
+              *) refuse "${label} is only partly configured in the desktop-release environment. Missing: ${found}." ;;
+            esac
+          }
+
+          misnamed="$(state CSC_LINK CSC_KEY_PASSWORD APPLE_API_KEY)"
+          if [ "${misnamed}" != "none" ]; then
+            refuse "The environment has a secret named CSC_LINK, CSC_KEY_PASSWORD or APPLE_API_KEY, which nothing reads. The names are MAC_CSC_LINK, MAC_CSC_KEY_PASSWORD and APPLE_API_KEY_P8 (WIN_CSC_LINK and WIN_CSC_KEY_PASSWORD for Windows)."
+          fi
+
+          mac=""
+          mac_description="ad-hoc signed, not notarized: no certificate is configured"
+          win=""
+          win_description="not signed: no certificate is configured"
+          legs=""
+          if complete "Apple signing" MAC_CSC_LINK MAC_CSC_KEY_PASSWORD APPLE_API_KEY_P8 APPLE_API_KEY_ID APPLE_API_ISSUER; then
+            mac=developer-id
+            mac_description="signed with a Developer ID and notarized by Apple"
+            legs='{"name":"macOS arm64","key":"macos-arm64","os":"macos-15","mode":"developer-id","timeout":240,"description":"'"${mac_description}"'"}'
+          fi
+          # Both are looked at, so that a half-set one is refused even when
+          # the other is complete. Azure wins when both are.
+          azure=false
+          pfx=false
+          if complete "Azure Trusted Signing" AZURE_TENANT_ID AZURE_CLIENT_ID AZURE_CLIENT_SECRET AZURE_SIGN_ENDPOINT AZURE_SIGN_ACCOUNT AZURE_SIGN_PROFILE AZURE_SIGN_PUBLISHER; then azure=true; fi
+          if complete "The Windows certificate" WIN_CSC_LINK WIN_CSC_KEY_PASSWORD; then pfx=true; fi
+          if [ "${azure}" = "true" ]; then
+            win=azure
+            win_description="signed with Azure Trusted Signing"
+          elif [ "${pfx}" = "true" ]; then
+            win=pfx
+            win_description="signed with the publisher's certificate"
+          fi
+          if [ -n "${win}" ]; then
+            legs="${legs:+${legs},}"'{"name":"Windows x64","key":"windows-x64","os":"windows-2022","mode":"'"${win}"'","timeout":120,"description":"'"${win_description}"'"}'
+          fi
+          {
+            echo "mac=${mac}"
+            echo "win=${win}"
+            echo "mac_description=${mac_description}"
+            echo "win_description=${win_description}"
+            echo "legs=[${legs}]"
+          } >> "${GITHUB_OUTPUT}"
+          {
+            echo "macOS: ${mac_description}"
+            echo "Windows: ${win_description}"
+          } | tee -a "${GITHUB_STEP_SUMMARY}"
+
   build:
     name: Build (${{ matrix.name }})
-    needs: unit
+    # The gate is skipped for every build but a release.
+    needs: [unit, gate]
+    if: ${{ !cancelled() && needs.unit.result == 'success' && (needs.gate.result == 'success' || needs.gate.result == 'skipped') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: ${{ matrix.timeout }}
+    env:
+      # How the `sign` job will sign this leg. Empty: nobody signs it, and
+      # it is packaged here.
+      SIGNED_LATER: ${{ needs.gate.outputs[matrix.signer] }}
     strategy:
       fail-fast: false
       matrix:
@@ -95,12 +250,14 @@ jobs:
             key: windows-x64
             os: windows-2022
             python: python/python.exe
+            signer: win
             timeout: 120
             smoke_timeout: 600
           - name: macOS arm64
             key: macos-arm64
             os: macos-15
             python: python/bin/python3
+            signer: mac
             # 3 cores and 7 GB: the frontend build and a 6 GB stack both swap.
             timeout: 180
             smoke_timeout: 900
@@ -108,6 +265,7 @@ jobs:
             key: linux-x64
             os: ubuntu-22.04
             python: python/bin/python3
+            signer: none
             timeout: 120
             smoke_timeout: 600
     defaults:
@@ -285,24 +443,63 @@ jobs:
           rm -rf ../frontend/node_modules ../frontend/.next
           df -h .
 
-      - name: Package
+      # --- version: decided before anything is packaged -----------------------
+
+      - name: Version
+        id: version
         env:
-          # No certificate here: Windows is unsigned and macOS is ad-hoc
-          # signed (package.json). electron-builder skips every macOS
+          REQUESTED: ${{ inputs.version }}
+        run: |
+          version="${REQUESTED:-0.0.0-dev.${GITHUB_RUN_NUMBER}}"
+          # Semantic versioning to the letter: 1.2.03 and 1.2.3-rc.01 are not
+          # versions, and electron-updater refuses them in an installed app.
+          number='(0|[1-9][0-9]*)'
+          identifier='(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)'
+          if ! [[ "${version}" =~ ^${number}\.${number}\.${number}(-${identifier}(\.${identifier})*)?$ ]]; then
+            echo "::error::'${version}' is not a version such as 1.2.3 or 1.2.3-rc.1."
+            exit 1
+          fi
+          # What the upgrade test installs over this build: the next patch.
+          next="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.$((BASH_REMATCH[3] + 1))${BASH_REMATCH[4]}"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "next=${next}" >> "${GITHUB_OUTPUT}"
+          echo "Building ${version} (the upgrade test uses ${next})"
+
+      - name: Install the packaging tools
+        run: npm ci --no-audit --no-fund
+
+      # Again, now that the packages are there: some tests read
+      # electron-updater and @electron/osx-sign and are skipped without them.
+      - name: Shell tests against the installed packages
+        run: node --test "test/*.test.js"
+
+      # --- a leg nobody signs is packaged here ---------------------------------
+
+      - name: Package (no certificate)
+        if: env.SIGNED_LATER == ''
+        env:
+          AUTOGPT_DESKTOP_VERSION: ${{ steps.version.outputs.version }}
+          # Windows is unsigned and macOS is ad-hoc signed
+          # (electron-builder.config.js). electron-builder skips every macOS
           # signature, the ad-hoc one too, on pull requests unless told to.
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
           CSC_FOR_PULL_REQUEST: "true"
-        run: |
-          npm ci --no-audit --no-fund
-          npx electron-builder --publish never
+        run: npx electron-builder --config electron-builder.config.js --publish never
 
-      - name: Verify the macOS signature
-        if: runner.os == 'macOS'
-        run: codesign --verify --deep --strict --verbose=2 dist/mac-arm64/AutoGPT.app
+      # The bundle's seal, and the Claude Code CLI byte for byte as it was
+      # bundled: it ships as Anthropic built it.
+      - name: Verify the ad-hoc macOS signature
+        if: env.SIGNED_LATER == '' && runner.os == 'macOS'
+        run: |
+          app=dist/mac-arm64/AutoGPT.app
+          codesign --verify --deep --strict --verbose=2 "${app}"
+          cmp build/runtime/site/claude_agent_sdk/_bundled/claude \
+            "${app}/Contents/Resources/runtime/site/claude_agent_sdk/_bundled/claude"
 
       # Before the second packaging run, so that a failure there does not
       # lose the installers that are already built and verified.
       - name: Upload installers
+        if: env.SIGNED_LATER == ''
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: installers-${{ matrix.key }}
@@ -315,18 +512,66 @@ jobs:
           compression-level: 0
           retention-days: 7
 
+      # What a release has besides the installers: the files an installed
+      # app updates from, and a line for the release notes. All of them sit
+      # directly in dist/, so the artifact has no directories.
+      - name: Describe how this build is signed
+        if: env.SIGNED_LATER == '' && inputs.release_files
+        env:
+          LINE: "${{ matrix.name }}: ${{ needs.gate.outputs[format('{0}_description', matrix.signer)] || 'not signed' }}"
+        run: echo "${LINE}" > "dist/signing-${{ matrix.key }}.txt"
+
+      - name: Upload the other release files
+        if: env.SIGNED_LATER == '' && inputs.release_files
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ matrix.key }}
+          path: |
+            autogpt_platform/desktop/dist/latest*.yml
+            autogpt_platform/desktop/dist/*.blockmap
+            autogpt_platform/desktop/dist/*.zip
+            autogpt_platform/desktop/dist/signing-*.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      # --- a leg with a certificate is packaged by the `sign` job --------------
+
+      # A tar file, because an artifact keeps neither symbolic links nor the
+      # executable bit. Named without a directory: tar reads `D:\...` as a
+      # remote host.
+      - name: Pack the runtime for the signing job
+        if: env.SIGNED_LATER != ''
+        run: tar -cf runtime.tar -C build runtime
+
+      - name: Hand the runtime to the signing job
+        if: env.SIGNED_LATER != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: runtime-${{ matrix.key }}
+          path: autogpt_platform/desktop/runtime.tar
+          if-no-files-found: error
+          compression-level: 1
+          retention-days: 1
+
+      - name: Free the disk the archive took
+        if: env.SIGNED_LATER != ''
+        run: rm -f runtime.tar
+
       # What the upgrade test installs over the build above. A full second
       # packaging run, because the version has to be inside the app as well
       # as in the installer's name: a same-version .deb is not an upgrade.
+      # Never signed: it is installed by hand in the test, not by the updater.
       - name: Package the next version for the upgrade test
         if: inputs.e2e
         env:
+          AUTOGPT_DESKTOP_VERSION: ${{ steps.version.outputs.next }}
+          AUTOGPT_DESKTOP_OUTPUT: dist-upgrade
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
           CSC_FOR_PULL_REQUEST: "true"
         run: |
-          next="$(node -p "const [major, minor, patch] = require('./package.json').version.split('-')[0].split('.').map(Number); [major, minor, patch + 1].join('.')")"
           rm -rf dist/win-unpacked dist/mac-arm64 dist/linux-unpacked
-          npx electron-builder --publish never "-c.extraMetadata.version=${next}" -c.directories.output=dist-upgrade
+          npx electron-builder --config electron-builder.config.js --publish never
           if [ "${RUNNER_OS}" = macOS ]; then
             codesign --verify --deep --strict --verbose=2 dist-upgrade/mac-arm64/AutoGPT.app
           fi
@@ -359,6 +604,182 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  # The only job that holds the certificates. It runs the packaging tools and
+  # this repository's signing code (build/mac_sign.js) at the commit that was
+  # asked for, and nothing else: no build of the frontend or the backend, no
+  # install script of any package, no cache another job could have written,
+  # and nothing out of the runtime, which it only copies and signs.
+  sign:
+    name: Sign (${{ matrix.name }})
+    needs: [gate, build]
+    if: ${{ !cancelled() && needs.gate.result == 'success' && needs.build.result == 'success' && needs.gate.outputs.legs != '[]' }}
+    runs-on: ${{ matrix.os }}
+    # Signing a few thousand files, Apple's notary service with a 2 GB
+    # upload, then a second archive for the updater. On Windows every .exe
+    # in the bundle is signed, one request each.
+    timeout-minutes: ${{ matrix.timeout }}
+    environment: desktop-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.gate.outputs.legs) }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: autogpt_platform/desktop
+    env:
+      # The build job has checked that this is a version.
+      AUTOGPT_DESKTOP_VERSION: ${{ inputs.version || format('0.0.0-dev.{0}', github.run_number) }}
+    steps:
+      - name: Check out ${{ inputs.ref }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Download the runtime
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: runtime-${{ matrix.key }}
+          path: autogpt_platform/desktop
+
+      # The archive comes from the job that ran third-party code, so it is
+      # not trusted to stay where it belongs: after unpacking, the checkout
+      # must be exactly what it was plus build/runtime. This runs before the
+      # packaging tools are installed, so nothing it could have planted in
+      # node_modules survives either (`npm ci` starts from an empty one).
+      - name: Unpack the runtime
+        run: |
+          tar -xf runtime.tar -C build
+          rm runtime.tar
+          found="$(git status --porcelain --ignored)"
+          if [ "${found}" != "!! autogpt_platform/desktop/build/runtime/" ]; then
+            echo "::error::Unpacking the runtime changed more than build/runtime:"
+            echo "${found}"
+            exit 1
+          fi
+
+      # No install scripts: a package's script would run in the job that
+      # holds the certificates. electron-builder fetches Electron itself.
+      - name: Install the packaging tools
+        run: npm ci --no-audit --no-fund --ignore-scripts
+
+      # Exactly one of the next three steps runs.
+
+      - name: Package (macOS, Developer ID, notarized)
+        if: matrix.mode == 'developer-id'
+        env:
+          AUTOGPT_DESKTOP_MAC_SIGN: developer-id
+          CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          # notarytool wants the key as a file. It exists for this step only.
+          key="${RUNNER_TEMP}/AuthKey_${APPLE_API_KEY_ID}.p8"
+          trap 'rm -f "${key}"' EXIT
+          (umask 077 && printf '%s\n' "${APPLE_API_KEY_P8}" > "${key}")
+          unset APPLE_API_KEY_P8
+          APPLE_API_KEY="${key}" npx electron-builder --config electron-builder.config.js --publish never
+
+      - name: Package (Windows, Azure Trusted Signing)
+        if: matrix.mode == 'azure'
+        env:
+          AUTOGPT_DESKTOP_WIN_SIGN: azure
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_SIGN_ENDPOINT: ${{ vars.AZURE_SIGN_ENDPOINT }}
+          AZURE_SIGN_ACCOUNT: ${{ vars.AZURE_SIGN_ACCOUNT }}
+          AZURE_SIGN_PROFILE: ${{ vars.AZURE_SIGN_PROFILE }}
+          AZURE_SIGN_PUBLISHER: ${{ vars.AZURE_SIGN_PUBLISHER }}
+        run: npx electron-builder --config electron-builder.config.js --publish never
+
+      - name: Package (Windows, certificate file)
+        if: matrix.mode == 'pfx'
+        env:
+          AUTOGPT_DESKTOP_WIN_SIGN: pfx
+          WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+          WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+        run: npx electron-builder --config electron-builder.config.js --publish never
+
+      # The bundle's seal; the Claude Code CLI byte for byte as it was
+      # bundled (it ships as Anthropic built it); every Mach-O file signed
+      # for notarization by one team, each program's entitlements; the
+      # ticket stapled; and Gatekeeper's verdict.
+      - name: Verify the Developer ID signature and the notarization
+        if: matrix.mode == 'developer-id'
+        run: |
+          app=dist/mac-arm64/AutoGPT.app
+          codesign --verify --deep --strict --verbose=2 "${app}"
+          cmp build/runtime/site/claude_agent_sdk/_bundled/claude \
+            "${app}/Contents/Resources/runtime/site/claude_agent_sdk/_bundled/claude"
+          node build/mac_sign.js check "${app}"
+          xcrun stapler validate "${app}"
+          spctl --assess --type execute --verbose=4 "${app}"
+
+      - name: Verify the Windows signature
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $files = @(Get-ChildItem dist/*.exe) + @(Get-Item dist/win-unpacked/AutoGPT.exe)
+          foreach ($file in $files) {
+            $signature = Get-AuthenticodeSignature $file
+            if ($signature.Status -ne 'Valid') { throw "$($file.Name) is not validly signed: $($signature.Status)" }
+            "$($file.Name): $($signature.SignerCertificate.Subject)"
+          }
+          $bundled = (Get-FileHash build/runtime/site/claude_agent_sdk/_bundled/claude.exe).Hash
+          $shipped = (Get-FileHash dist/win-unpacked/resources/runtime/site/claude_agent_sdk/_bundled/claude.exe).Hash
+          if ($bundled -ne $shipped) { throw 'The Claude Code CLI was changed by signing.' }
+
+      - name: Upload installers
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: installers-${{ matrix.key }}
+          path: |
+            autogpt_platform/desktop/dist/*.exe
+            autogpt_platform/desktop/dist/*.dmg
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Describe how this build is signed
+        if: inputs.release_files
+        env:
+          LINE: "${{ matrix.name }}: ${{ matrix.description }}"
+        run: echo "${LINE}" > "dist/signing-${{ matrix.key }}.txt"
+
+      - name: Upload the other release files
+        if: inputs.release_files
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ matrix.key }}
+          path: |
+            autogpt_platform/desktop/dist/latest*.yml
+            autogpt_platform/desktop/dist/*.blockmap
+            autogpt_platform/desktop/dist/*.zip
+            autogpt_platform/desktop/dist/signing-*.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sign-logs-${{ matrix.key }}
+          path: autogpt_platform/desktop/dist/builder-debug.yml
+          if-no-files-found: ignore
+          retention-days: 7
+
   e2e:
     name: Installed app (${{ matrix.name }})
     # Not the default, which runs this only when every build leg succeeded:
@@ -366,7 +787,8 @@ jobs:
     # leg whose installers were never uploaded fails at its download step.
     # `skipped` is the build not having run at all (the unit tests failed).
     if: ${{ !cancelled() && inputs.e2e && needs.build.result != 'skipped' }}
-    needs: build
+    # A signed leg's installers come from the `sign` job.
+    needs: [build, sign]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     strategy:
