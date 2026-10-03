@@ -350,9 +350,13 @@ class Build:
             package,
             ignore=shutil.ignore_patterns("__pycache__"),
         )
+        # -B: the runtime must never write bytecode into the bundle. It is
+        # read-only when installed system-wide, and on macOS a file changed
+        # inside the app breaks its code signature.
+        arguments = ["-B", "-m", "autogpt_desktop", "serve"]
         manifest = {
-            "win32": {"command": "python/python.exe", "args": ["-m", "autogpt_desktop", "serve"]},
-            "default": {"command": "python/bin/python3", "args": ["-m", "autogpt_desktop", "serve"]},
+            "win32": {"command": "python/python.exe", "args": arguments},
+            "default": {"command": "python/bin/python3", "args": arguments},
         }
         (self.out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
 
@@ -421,14 +425,19 @@ class Build:
         read-only, so without this every service would recompile every module
         on every start (measured: 51s to ready without, 34s with).
         `unchecked-hash` trusts the .pyc without stat-ing its source, which
-        suits files an installer may give fresh timestamps."""
+        suits files an installer may give fresh timestamps. Forced, and run
+        with -B: earlier steps and this interpreter's own startup leave
+        ordinary timestamp-checked .pyc files behind, which an installed app
+        would find stale and try to rewrite."""
         library = self.python.parent / "Lib" if WINDOWS else self.out / "python" / "lib"
         run(
             [
                 str(self.python),
+                "-B",
                 "-m",
                 "compileall",
                 "-q",
+                "-f",
                 "-j",
                 "0",
                 "--invalidation-mode",

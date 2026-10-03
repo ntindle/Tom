@@ -3,9 +3,10 @@
     <runtime>/python/python smoke_test.py <runtime> [--timeout 600]
 
 Run it with the bundle's own interpreter (it uses psutil from the bundle).
-This is the shell's contract exercised without the shell: start the runtime,
-read JSON events from stdout until `ready`, close stdin, expect exit code 0
-and no process from the bundle left running.
+This is the shell's contract exercised without the shell: start the runtime
+as the bundle's manifest says to, read JSON events from stdout until `ready`,
+close stdin, expect exit code 0, no process from the bundle left running, and
+no file in the bundle changed.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import argparse
 import contextlib
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -42,10 +44,11 @@ def main() -> int:
     args = parser.parse_args()
     runtime = args.runtime.resolve()
     data = args.data_dir or Path(tempfile.mkdtemp(prefix="autogpt-smoke-"))
+    bundle_before = snapshot(runtime)
 
     started = time.monotonic()
     process = subprocess.Popen(
-        [sys.executable, "-m", "autogpt_desktop", "serve"],
+        shell_command(runtime),
         cwd=runtime,
         env={**os.environ, "AUTOGPT_DESKTOP_DATA_DIR": str(data)},
         stdin=subprocess.PIPE,
@@ -79,6 +82,7 @@ def main() -> int:
         for leftover in leftovers:  # do not leave the machine dirty
             with contextlib.suppress(psutil.Error):
                 leftover.kill()
+    failures += changed_files(bundle_before, snapshot(runtime))
 
     if failures:
         print("\nFAILED")
@@ -88,6 +92,38 @@ def main() -> int:
         return 1
     print(f"\nOK in {time.monotonic() - started:.0f}s")
     return 0
+
+
+def snapshot(runtime: Path) -> dict[str, tuple[int, int]]:
+    """Size and modification time of every file in the bundle."""
+    files = {}
+    for path in runtime.rglob("*"):
+        status = path.lstat()
+        if stat.S_ISREG(status.st_mode):
+            files[str(path.relative_to(runtime))] = (status.st_size, status.st_mtime_ns)
+    return files
+
+
+def changed_files(
+    before: dict[str, tuple[int, int]], after: dict[str, tuple[int, int]]
+) -> list[str]:
+    """Running the app must leave its bundle exactly as it was: installed, the
+    bundle may be read-only, and on macOS a changed file breaks the code
+    signature."""
+    changed = sorted(
+        name for name in before.keys() | after.keys() if before.get(name) != after.get(name)
+    )
+    if not changed:
+        return []
+    listed = ", ".join(changed[:5]) + (" ..." if len(changed) > 5 else "")
+    return [f"the run changed {len(changed)} file(s) in the bundle: {listed}"]
+
+
+def shell_command(runtime: Path) -> list[str]:
+    """What the shell runs: the bundle's manifest.json (src/paths.js)."""
+    manifest = json.loads((runtime / "manifest.json").read_text(encoding="utf-8"))
+    entry = manifest.get(sys.platform, manifest["default"])
+    return [str(runtime / entry["command"]), *entry["args"]]
 
 
 def wait_for_ready(process: subprocess.Popen[str], timeout: int, started: float) -> str | None:
