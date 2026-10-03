@@ -1,0 +1,64 @@
+{
+  "name": "autogpt-desktop",
+  "productName": "AutoGPT",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Experimental desktop distribution of the AutoGPT Platform",
+  "author": "Significant Gravitas <info@agpt.co>",
+  "license": "SEE LICENSE IN LICENSE.md",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test \"test/*.test.js\"",
+    "dist": "electron-builder --publish never",
+    "dist:dir": "electron-builder --dir --publish never"
+  },
+  "devDependencies": {
+    "electron": "44.5.1",
+    "electron-builder": "26.15.3"
+  },
+  "build": {
+    "appId": "co.agpt.autogpt.desktop",
+    "productName": "AutoGPT",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "src/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "build/runtime",
+        "to": "runtime",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "asar": true,
+    "win": {
+      "target": [
+        "nsis"
+      ]
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "deleteAppDataOnUninstall": false
+    },
+    "mac": {
+      "target": [
+        "dmg"
+      ],
+      "category": "public.app-category.productivity"
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "category": "Utility"
+    }
+  }
+}
