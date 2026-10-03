@@ -231,9 +231,3 @@ autogpt_platform/frontend/public/vad/
 
 # Dependency and tool caches; vitest wrote one to the repo root once.
 node_modules/
-
-# Desktop distribution build outputs
-autogpt_platform/desktop/build/runtime/
-autogpt_platform/desktop/build/.cache/
-autogpt_platform/desktop/dist/
-autogpt_platform/desktop/node_modules/
