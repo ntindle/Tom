@@ -142,7 +142,8 @@ jobs:
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: |
-          npm ci
+          npm install --no-audit --no-fund
+          node node_modules/electron/install.js
           npx electron-builder --publish never
 
       - name: Upload installers

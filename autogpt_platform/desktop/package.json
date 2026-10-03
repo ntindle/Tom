@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "private": true,
   "description": "Experimental desktop distribution of the AutoGPT Platform",
+  "homepage": "https://agpt.co",
   "author": "Significant Gravitas <info@agpt.co>",
   "license": "SEE LICENSE IN LICENSE.md",
   "main": "src/main.js",
