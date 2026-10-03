@@ -151,8 +151,12 @@ class Build:
         )
         engines = modules / "@prisma" / "engines"
         for kind in ("query-engine", "schema-engine"):
+            # e.g. query-engine-windows.exe, query-engine-darwin-arm64,
+            # query-engine-debian-openssl-3.0.x (not the .node library builds).
             engine = _single(
-                path for path in engines.glob(f"{kind}-*") if path.suffix in ("", ".exe")
+                path
+                for path in engines.glob(f"{kind}-*")
+                if not path.name.endswith((".node", ".gz", ".sha256", ".tmp"))
             )
             shutil.copy2(engine, target / f"{kind}{EXE}")
 
