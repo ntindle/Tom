@@ -64,6 +64,88 @@ def test_the_public_port_is_waited_for_before_it_is_given_up(tmp_path: Path):
     assert ports.allocate(path) == first
 
 
+def free_port() -> int:
+    return ports._free_port(exclude=set())
+
+
+def test_a_new_install_takes_the_preferred_public_port(tmp_path: Path, monkeypatch):
+    preferred = free_port()
+    monkeypatch.setattr(ports, "PREFERRED", {"public": preferred})
+    path = tmp_path / "ports.json"
+
+    first = ports.allocate(path)
+
+    assert first["public"] == preferred
+    assert list(first.values()).count(preferred) == 1
+    assert ports.allocate(path) == first
+
+
+def test_an_install_that_has_a_port_is_never_moved_to_the_preferred_one(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr(ports, "PREFERRED", {})
+    path = tmp_path / "ports.json"
+    first = ports.allocate(path)
+
+    monkeypatch.setattr(ports, "PREFERRED", {"public": free_port()})
+    assert ports.allocate(path) == first
+
+    # Not even when its own port is taken: the preference is for installs
+    # that have nothing to lose yet.
+    monkeypatch.setattr(ports, "PUBLIC_PORT_PATIENCE_SECONDS", 0)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as squatter:
+        squatter.bind(("127.0.0.1", first["public"]))
+        moved = ports.allocate(path)
+    assert moved["public"] not in (first["public"], ports.PREFERRED["public"])
+
+
+def test_a_busy_preferred_port_falls_back_to_a_free_one(tmp_path: Path, monkeypatch):
+    preferred = free_port()
+    monkeypatch.setattr(ports, "PREFERRED", {"public": preferred})
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as squatter:
+        squatter.bind(("127.0.0.1", preferred))
+        first = ports.allocate(tmp_path / "ports.json")
+
+    assert first["public"] != preferred
+    assert first["public"] in ports.PORT_RANGE
+    # ...and that is now this install's port, even once the preferred one is free.
+    assert ports.allocate(tmp_path / "ports.json") == first
+
+
+def test_a_port_with_a_live_listener_is_not_free():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", free_port()))
+        listener.listen()
+        assert ports._is_free(listener.getsockname()[1]) is False
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows has no TIME_WAIT bind refusal")
+def test_a_port_its_last_listener_just_left_is_free_at_once():
+    """The proxy closes its connections first on every stop, which leaves the
+    port in TIME_WAIT for a minute. A restart must not read that as taken and
+    move the app's address."""
+    port = free_port()
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        # As asyncio sets it for the proxy, and every bundled server for itself.
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", port))
+        listener.listen()
+        with socket.create_connection(("127.0.0.1", port)) as client:
+            accepted, _ = listener.accept()
+            accepted.close()  # the server side closes first
+            assert client.recv(1) == b""
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as plain, pytest.raises(OSError):
+        plain.bind(("127.0.0.1", port))  # what the probe used to do
+    assert ports._is_free(port) is True
+
+
+def test_the_preferred_port_is_usable_and_not_a_well_known_default():
+    port = ports.PREFERRED["public"]
+    assert port in ports.PORT_RANGE  # _is_free rejects anything outside it
+    assert port not in {15672, 16379, 17500, 18080, 19132, 25565, 27017, 28015}
+
+
 def test_secrets_are_generated_once(bundle: Bundle, data: DataDir):
     first = settings.ensure_secrets(bundle, data)
     assert first == settings.ensure_secrets(bundle, data)
@@ -96,18 +178,29 @@ def test_user_settings_cannot_override_the_runtime_wiring(bundle: Bundle, data: 
     assert "elsewhere" not in env["DATABASE_URL"]
 
 
-def test_registration_is_open_until_the_user_closes_it(bundle: Bundle, data: DataDir):
+def test_registration_is_open_until_an_owner_exists_or_the_user_decides(
+    bundle: Bundle, data: DataDir
+):
+    """The gate is set once the accounts are counted (Stack.secure_owner,
+    tests/test_owner.py); the frontend gets whatever it was set to."""
     secret = settings.ensure_secrets(bundle, data)
     port = ports.allocate(data.ports_file)
 
-    def allowed(user: dict[str, str]) -> str:
+    def allowed(user: dict[str, str], identities: int) -> str:
         backend = settings.backend_environment(bundle, data, port, secret, user)
+        backend["AUTH_ALLOW_NEW_ACCOUNTS"] = settings.registration_gate(
+            backend.get("AUTH_ALLOW_NEW_ACCOUNTS"), identities
+        )
         frontend = settings.frontend_environment(backend, port, secret, data)
         assert frontend["AUTH_ALLOW_NEW_ACCOUNTS"] == backend["AUTH_ALLOW_NEW_ACCOUNTS"]
         return backend["AUTH_ALLOW_NEW_ACCOUNTS"]
 
-    assert allowed({}) == "true"
-    assert allowed({"AUTH_ALLOW_NEW_ACCOUNTS": "false"}) == "false"
+    assert allowed({}, identities=0) == "true"
+    assert allowed({}, identities=1) == "false"
+    assert allowed({"AUTH_ALLOW_NEW_ACCOUNTS": "false"}, identities=1) == "false"
+    assert allowed({"AUTH_ALLOW_NEW_ACCOUNTS": "true"}, identities=1) == "true"
+    # Closed before anybody exists, the install could never get its owner.
+    assert allowed({"AUTH_ALLOW_NEW_ACCOUNTS": "false"}, identities=0) == "true"
 
 
 def test_services_get_a_home_of_their_own(bundle: Bundle, data: DataDir):

@@ -54,6 +54,10 @@ RESTART_WINDOW_SECONDS = 300
 APP_READY_TIMEOUT_SECONDS = 300
 # What the shell allows a stop before it kills the runtime (src/runtime.js).
 SHELL_STOP_GRACE_SECONDS = 60
+PASSWORD_RESET_LOST = (
+    "The owner password was not changed, because AutoGPT did not finish "
+    "starting. Reset it again."
+)
 
 
 class StartupError(RuntimeError):
@@ -72,6 +76,7 @@ class Stack:
         self.env: dict[str, str] = {}
         self.oneshot: ManagedProcess | None = None
         self.migrating = False
+        self.password_reset: str | None = None
 
     @property
     def processes(self) -> list[ManagedProcess]:
@@ -88,9 +93,10 @@ class Stack:
             url = self.start()
         except Exception as exc:
             cancelled = self.stop_requested.is_set()
+            lost = self.forget_password_reset()
             if not cancelled:
                 logger.exception("startup failed")
-                events.error(str(exc), fatal=True)
+                events.error(f"{exc} {lost}".strip(), fatal=True)
             return 0 if cancelled else 1
         events.ready(url)
         self.publish_skills_catalog()
@@ -106,12 +112,28 @@ class Stack:
                 bootstrap.MIGRATION_TIMEOUT_SECONDS + SHELL_STOP_GRACE_SECONDS,
             )
 
+    def forget_password_reset(self) -> str:
+        """The password file is deleted as soon as it is read, so a start that
+        ends before the reset is applied has lost it. Say so: the owner, who
+        does not know the old password, would otherwise find the new one
+        refused with no hint why."""
+        if self.password_reset is None:
+            return ""
+        self.password_reset = None
+        logger.warning(PASSWORD_RESET_LOST)
+        return PASSWORD_RESET_LOST
+
     def raise_if_cancelled(self) -> None:
         if self.stop_requested.is_set():
             raise StartupError("startup was cancelled")
 
     def start(self) -> str:
         bundle, data = self.bundle, self.data
+        # First, ahead of anything that can fail: whatever happens to this
+        # start, the password does not stay on disk in the clear.
+        self.password_reset = bootstrap.take_password_reset(
+            data.config / bootstrap.RESET_PASSWORD_FILE
+        )
         events.progress("config", "Preparing configuration")
         data.prepare()
         self.registry.reap_leftovers()
@@ -206,13 +228,30 @@ class Stack:
         self.migrating = True
         try:
             self.raise_if_cancelled()
+            bootstrap.remove_owner_trigger(connect)
             bootstrap.apply_migrations(self.bundle, self.env)
         finally:
             self.migrating = False
         bootstrap.configure_frontend_role(
             self.bundle, connect, secret["AUTOGPT_FRONTEND_DB_PASSWORD"]
         )
+        self.secure_owner(connect)
         postgres.first_run_completed(self.data)
+
+    def secure_owner(self, connect) -> None:
+        """The first account is the owner; once it exists, registration is
+        closed unless settings.env reopens it. `start_apps` hands the frontend
+        its environment after this, so the gate can still be set here."""
+        configured = self.env.get("AUTH_ALLOW_NEW_ACCOUNTS")
+        identities = bootstrap.ensure_owner(
+            connect, settings.closes_registration(configured)
+        )
+        self.env["AUTH_ALLOW_NEW_ACCOUNTS"] = settings.registration_gate(
+            configured, identities
+        )
+        password, self.password_reset = self.password_reset, None
+        if password:
+            bootstrap.reset_owner_password(connect, password)
 
     def start_apps(self, port: dict[str, int], secret: dict[str, str]) -> None:
         bundle, data = self.bundle, self.data

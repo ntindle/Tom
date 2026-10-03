@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import logging
 import secrets
 import sys
 from pathlib import Path
@@ -18,6 +19,8 @@ from types import ModuleType
 from urllib.parse import quote
 
 from autogpt_desktop.layout import Bundle, DataDir, write_private
+
+logger = logging.getLogger("autogpt_desktop")
 
 DB_CONNECTION_LIMIT = 5
 FRONTEND_DB_ROLE = "autogpt_frontend"
@@ -37,8 +40,9 @@ GROQ_API_KEY=
 # CHAT_USE_LOCAL=true
 # CHAT_BASE_URL=http://127.0.0.1:11434/v1
 # CHAT_API_KEY=ollama
-# Once you have your account, stop anyone else on this computer creating one:
-# AUTH_ALLOW_NEW_ACCOUNTS=false
+# The first account created is the owner and an admin, and registration then
+# closes by itself. To let more people create accounts (ordinary users):
+# AUTH_ALLOW_NEW_ACCOUNTS=true
 """
 
 # What the Next server is given of the backend's environment: the appliance's
@@ -110,7 +114,6 @@ def backend_environment(
         "APP_ENV": "dev",
         "BEHAVE_AS": "local",
         "ENABLE_AUTH": "true",
-        "AUTH_ALLOW_NEW_ACCOUNTS": user.get("AUTH_ALLOW_NEW_ACCOUNTS", "true"),
         "AUTH_REQUIRE_EMAIL_VERIFICATION": "false",
         "JWT_VERIFY_KEY": "",
         "SUPABASE_JWT_SECRET": "",
@@ -185,6 +188,33 @@ def backend_environment(
         **_service_addresses(ports),
     }
     return env
+
+
+def closes_registration(configured: str | None) -> bool:
+    """Whether the database refuses accounts after the owner's. It does unless
+    settings.env says AUTH_ALLOW_NEW_ACCOUNTS=true in so many words."""
+    return (configured or "").strip().lower() != "true"
+
+
+def registration_gate(configured: str | None, identities: int | None) -> str:
+    """AUTH_ALLOW_NEW_ACCOUNTS as the frontend gets it: what settings.env
+    says, otherwise open until the owner exists and closed from then on. The
+    frontend reads it once, so it is the next start that shows a refused
+    sign-up the proper message; until then the database refuses it.
+
+    With no account at all it is open whatever settings.env says: closed, the
+    install could never get its owner. `identities` is None when the accounts
+    could not be counted, and then only an explicit setting closes it."""
+    if identities == 0:
+        if configured and closes_registration(configured):
+            logger.info(
+                f"AUTH_ALLOW_NEW_ACCOUNTS={configured} takes effect once the "
+                "owner account exists; until then the first sign-up is allowed"
+            )
+        return "true"
+    if configured:
+        return "false" if closes_registration(configured) else "true"
+    return "false" if identities else "true"
 
 
 def frontend_environment(

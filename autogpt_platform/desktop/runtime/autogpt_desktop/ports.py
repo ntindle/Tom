@@ -13,6 +13,7 @@ import json
 import logging
 import random
 import socket
+import sys
 import time
 from pathlib import Path
 
@@ -23,6 +24,13 @@ logger = logging.getLogger("autogpt_desktop")
 # some other program's outbound connection between boots.
 PORT_RANGE = range(15000, 32000)
 PUBLIC_PORT_PATIENCE_SECONDS = 5
+
+# Tried first on an install that has no port yet, so that most installs share
+# one address and OAuth redirect URIs can be documented once. Unassigned in
+# the IANA registry (18464-18515, checked 2026-10-03) and nobody's default.
+# An install that already has a port keeps it: moving it signs the user out
+# and breaks the redirect URIs they registered.
+PREFERRED = {"public": 18473}
 
 PORT_NAMES = (
     "public",
@@ -53,6 +61,8 @@ def allocate(path: Path, names: tuple[str, ...] = PORT_NAMES) -> dict[str, int]:
         port = stored.get(name)
         if not (isinstance(port, int) and _is_free(port, wait=name == "public")):
             port = None
+        if port is None and name not in stored:
+            port = _preferred(name)
         if port is None or port in ports.values():
             port = _free_port(exclude=set(ports.values()))
             if name in stored:
@@ -72,6 +82,11 @@ def _read(path: Path) -> dict[str, object]:
     return value if isinstance(value, dict) else {}
 
 
+def _preferred(name: str) -> int | None:
+    port = PREFERRED.get(name)
+    return port if port is not None and _is_free(port) else None
+
+
 def _is_free(port: int, *, wait: bool = False) -> bool:
     """`wait` gives a busy port a few seconds to come free before giving up
     on it. Worth it for the public port only: moving that one signs the user
@@ -80,20 +95,50 @@ def _is_free(port: int, *, wait: bool = False) -> bool:
     if port not in PORT_RANGE:
         return False
     deadline = time.monotonic() + (PUBLIC_PORT_PATIENCE_SECONDS if wait else 0)
-    while True:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-            try:
-                probe.bind(("127.0.0.1", port))
-                return True
-            except OSError:
-                if time.monotonic() >= deadline:
-                    return False
+    while not _can_listen(port):
+        if time.monotonic() >= deadline:
+            return False
         time.sleep(0.25)
+    return True
+
+
+def _can_listen(port: int) -> bool:
+    """Whether a server started now could have the port.
+
+    Outside Windows a plain bind is refused for up to a minute after the
+    port's last listener closed a connection (TIME_WAIT), which the proxy
+    does on every stop; a restart seconds later would read that as "taken"
+    and move the app. Servers get past it with SO_REUSEADDR, so the probe
+    asks the same way. On macOS that option also lets a bind succeed beside
+    another program listening on every address, hence the connection attempt.
+    On Windows a plain bind is already exact, and SO_REUSEADDR would bind
+    over a live listener."""
+    if sys.platform == "win32":
+        return _can_bind(port, reuse_address=False)
+    return _can_bind(port, reuse_address=True) and not _answers(port)
+
+
+def _can_bind(port: int, *, reuse_address: bool) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        if reuse_address:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            probe.bind(("127.0.0.1", port))
+        except OSError:
+            return False
+    return True
+
+
+def _answers(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client:
+        client.settimeout(0.5)
+        return client.connect_ex(("127.0.0.1", port)) == 0
 
 
 def _free_port(exclude: set[int]) -> int:
+    reserved = exclude | set(PREFERRED.values())
     for _ in range(1000):
         port = random.choice(PORT_RANGE)
-        if port not in exclude and _is_free(port):
+        if port not in reserved and _is_free(port):
             return port
     raise RuntimeError("no free local port found")
