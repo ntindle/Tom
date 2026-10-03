@@ -17,6 +17,7 @@ import secrets
 import sys
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 from urllib.parse import quote
 
 from autogpt_desktop.layout import Bundle, DataDir, write_private
@@ -24,6 +25,13 @@ from autogpt_desktop.layout import Bundle, DataDir, write_private
 logger = logging.getLogger("autogpt_desktop")
 
 DB_CONNECTION_LIMIT = 5
+# The connection pool's settings, with the appliance's default and bounds
+# (entrypoint.sh normalize_integer): default, lowest, highest.
+DB_SETTINGS = {
+    "DB_CONNECTION_LIMIT": (DB_CONNECTION_LIMIT, 1, DB_CONNECTION_LIMIT),
+    "DB_CONNECT_TIMEOUT": (60, 1, 600),
+    "DB_POOL_TIMEOUT": (300, 1, 3600),
+}
 FRONTEND_DB_ROLE = "autogpt_frontend"
 
 # Desktop-only secrets. runtime_config.py rejects unknown keys in its own file,
@@ -80,7 +88,51 @@ def load_runtime_config_module(bundle: Bundle) -> ModuleType:
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    if sys.platform == "win32":
+        vars(module)["os"] = WindowsOs(os)
     return module
+
+
+class WindowsOs:
+    """`os` as the appliance's runtime_config.py needs it on Windows.
+
+    That file is upstream's and is loaded as it is. Writing runtime.env, it
+    calls os.fchmod, which Windows has only since Python 3.13, and it opens
+    the config directory to fsync the rename, which Windows refuses: a
+    directory is not a file there, and NTFS journals the rename anyway. The
+    module reaches all of it through its global `os`, so it is handed this
+    in its place. upstream/runtime-config-windows.patch is the same fix
+    offered upstream; when the appliance has it, delete this class.
+    """
+
+    def __init__(self, real: Any) -> None:
+        self._real = real
+        self._directories: set[int] = set()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._real, name)
+
+    def fchmod(self, descriptor: int, mode: int) -> None:
+        change = getattr(self._real, "fchmod", None)
+        if change:
+            change(descriptor, mode)
+
+    def open(self, path: str | os.PathLike[str], flags: int, mode: int = 0o777) -> int:
+        if not self._real.path.isdir(path):
+            return self._real.open(path, flags, mode)
+        # A real descriptor stands in for the directory's, so that closing
+        # it is an ordinary close; fsync is what must not reach it.
+        descriptor = self._real.open(self._real.devnull, self._real.O_RDONLY)
+        self._directories.add(descriptor)
+        return descriptor
+
+    def fsync(self, descriptor: int) -> None:
+        if descriptor not in self._directories:
+            self._real.fsync(descriptor)
+
+    def close(self, descriptor: int) -> None:
+        self._directories.discard(descriptor)
+        self._real.close(descriptor)
 
 
 def ensure_secrets(bundle: Bundle, data: DataDir) -> dict[str, str]:
@@ -112,6 +164,7 @@ def backend_environment(
         "postgres", secret["POSTGRES_PASSWORD"], ports["postgres"], "platform"
     )
     frontend_origin = f"http://127.0.0.1:{ports['frontend']}"
+    pool = _database_settings(user)
     env = {
         **(defaults or {}),
         **user,
@@ -135,9 +188,11 @@ def backend_environment(
         "VAPID_PRIVATE_KEY": secret["VAPID_PRIVATE_KEY"],
         "VAPID_PUBLIC_KEY": secret["VAPID_PUBLIC_KEY"],
         "VAPID_CLAIM_EMAIL": user.get("VAPID_CLAIM_EMAIL", "mailto:admin@localhost"),
-        "DATABASE_URL": f"{database}&connection_limit={DB_CONNECTION_LIMIT}"
-        "&connect_timeout=60&pool_timeout=300",
-        "DIRECT_URL": f"{database}&connect_timeout=60",
+        **pool,
+        "DATABASE_URL": f"{database}&connection_limit={pool['DB_CONNECTION_LIMIT']}"
+        f"&connect_timeout={pool['DB_CONNECT_TIMEOUT']}"
+        f"&pool_timeout={pool['DB_POOL_TIMEOUT']}",
+        "DIRECT_URL": f"{database}&connect_timeout={pool['DB_CONNECT_TIMEOUT']}",
         "DB_HOST": "127.0.0.1",
         "DB_PORT": str(ports["postgres"]),
         "DB_USER": "postgres",
@@ -197,6 +252,28 @@ def backend_environment(
         **_service_addresses(ports),
     }
     return env
+
+
+def _database_settings(user: dict[str, str]) -> dict[str, str]:
+    """DB_SETTINGS as the services get them. The backend reads each from the
+    environment in preference to DATABASE_URL, and takes its query timeout
+    from DB_POOL_TIMEOUT (backend/data/db.py), so they are exported as well as
+    written into the URLs. settings.env may move one inside the appliance's
+    bounds. Where the appliance refuses to start over a value outside them,
+    the default is used here: a typo must not keep the app from opening."""
+    chosen = {}
+    for name, (default, lowest, highest) in DB_SETTINGS.items():
+        value = user.get(name, "")
+        if value.isascii() and value.isdigit() and lowest <= int(value) <= highest:
+            chosen[name] = str(int(value))
+            continue
+        if value:
+            logger.warning(
+                f"{name}={value} in settings.env is not a number from {lowest} to "
+                f"{highest}; using {default}"
+            )
+        chosen[name] = str(default)
+    return chosen
 
 
 def _bundled_tools(bundle: Bundle) -> dict[str, str]:
