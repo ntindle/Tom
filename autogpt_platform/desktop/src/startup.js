@@ -13,5 +13,15 @@ window.autogpt.onRuntimeEvent((event) => {
   }
 });
 
+// Shown with a failed start only (#actions): a newer version may be the fix.
+const update = document.getElementById("update");
+window.autogpt.onUpdateOffer((offer) => {
+  update.hidden = !offer;
+  if (!offer) return;
+  update.textContent = offer.label;
+  update.disabled = !offer.action;
+});
+update.addEventListener("click", () => window.autogpt.takeUpdateOffer());
+
 document.getElementById("logs").addEventListener("click", () => window.autogpt.openLogs());
 document.getElementById("quit").addEventListener("click", () => window.autogpt.quit());

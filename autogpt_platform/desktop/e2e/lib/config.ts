@@ -51,10 +51,15 @@ export function dataDir(): string {
   return path.join(process.env.XDG_DATA_HOME || path.join(home, ".local", "share"), "AutoGPT");
 }
 
+/** The app under test must not look for updates: a release build would
+ * fetch the latest release from GitHub in the middle of the tests. */
+export const UPDATES_OFF = "AUTOGPT_DESKTOP_UPDATES=off";
+
 /** What the app is started with: the caller's environment, minus what would
  * point a packaged app at a development runtime. */
 export function appEnvironment(): NodeJS.ProcessEnv {
   const env = { ...process.env };
+  env.AUTOGPT_DESKTOP_UPDATES = "off";
   delete env.AUTOGPT_DESKTOP_RUNTIME;
   delete env.AUTOGPT_DESKTOP_DATA_DIR;
   delete env.ELECTRON_RUN_AS_NODE;

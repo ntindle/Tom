@@ -8,7 +8,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { appEnvironment, dataDirOverride, installDirOverride, kind } from "./config";
+import { UPDATES_OFF, appEnvironment, dataDirOverride, installDirOverride, kind } from "./config";
 import { isUnder, listProcesses, type RunningProcess } from "./processes";
 
 const INSTALL_TIMEOUT_MS = 40 * 60_000;
@@ -40,7 +40,7 @@ export function appProcesses(): RunningProcess[] {
 }
 
 class WindowsInstall implements Platform {
-  // Per-user and one-click (package.json `nsis`): no elevation, no questions.
+  // Per-user and one-click (electron-builder.config.js `nsis`): no elevation, no questions.
   private readonly dir =
     installDirOverride ||
     path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local"), "Programs", "autogpt");
@@ -137,9 +137,8 @@ class MacInstall implements Platform {
   }
 
   launch(args: string[], logFile: string): Promise<void> {
-    const environment = dataDirOverride
-      ? ["--env", `AUTOGPT_DESKTOP_DATA_DIR=${path.resolve(dataDirOverride)}`]
-      : [];
+    const environment = ["--env", UPDATES_OFF];
+    if (dataDirOverride) environment.push("--env", `AUTOGPT_DESKTOP_DATA_DIR=${path.resolve(dataDirOverride)}`);
     // `open` returns at once and the app is not its child: it has to be
     // told where the app's own output goes.
     const output = ["--stdout", logFile, "--stderr", logFile];

@@ -23,7 +23,7 @@ test("uninstalls the app and keeps the data", async () => {
   expect(describe(appProcesses()), "processes still running after uninstalling").toBe("");
   expect(await registeredWithSystem(), "the system no longer lists the app").toBe(false);
 
-  // The database, with the account and the agent in it (package.json
+  // The database, with the account and the agent in it (electron-builder.config.js
   // `deleteAppDataOnUninstall: false`; the other installers never touch it).
   expect(fs.existsSync(path.join(dataDir(), "postgres", "PG_VERSION")), `${dataDir()} is kept`).toBe(true);
   await verifyFirewall();

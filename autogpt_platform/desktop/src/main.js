@@ -6,6 +6,7 @@ const {
   app,
   BrowserWindow,
   Menu,
+  Notification,
   Tray,
   clipboard,
   dialog,
@@ -21,6 +22,18 @@ const { applicationMenuTemplate, ownerMenuItems } = require("./owner");
 const { defaultDataDir, readRuntimeManifest, runtimeDir } = require("./paths");
 const { openResetPasswordWindow } = require("./reset-password-window");
 const { Runtime } = require("./runtime");
+const {
+  chooseAutoUpdater,
+  createUpdater,
+  dropsUpdaterQuit,
+  failedStartOffer,
+  fileLogger,
+  installsFromDownloadedFile,
+  releaseUrl,
+  updateMenuItems,
+  updateMode,
+  withUpdatesMenu,
+} = require("./updater");
 
 const ICON = path.join(__dirname, "icon.png");
 const dataDir = defaultDataDir();
@@ -35,6 +48,11 @@ let appUrl = null;
 let quitting = false;
 let restarting = false;
 let failure = null;
+let updater = null;
+let updaterStarted = false;
+let confirmingUpdate = false;
+let installingUpdate = false;
+let quitIsForUpdate = false;
 const history = [];
 
 if (!app.requestSingleInstanceLock()) {
@@ -61,6 +79,7 @@ function startRuntime() {
     manifest = readRuntimeManifest(dir);
   } catch (error) {
     report({ event: "error", fatal: true, message: `The runtime is missing: ${error.message}` });
+    lookForAFixedVersion();
     return;
   }
 
@@ -77,8 +96,10 @@ function startRuntime() {
     registryFile: path.join(dataDir, "run", "children.json"),
   });
   runtime = started;
-  // See lifecycle.js: a runtime that is being replaced is not listened to.
-  const heard = (event) => hearsRuntime({ current: runtime, sender: started, restarting, event });
+  // See lifecycle.js: a runtime that is being replaced is not listened to,
+  // and neither is one that is being stopped to install an update.
+  const heard = (event) =>
+    hearsRuntime({ current: runtime, sender: started, restarting: restarting || installingUpdate, event });
   started.on("event", (event) => heard(event) && onRuntimeEvent(event));
   started.on("exit", ({ code, expected }) => {
     if (expected || quitting || runtime !== started) return;
@@ -86,6 +107,7 @@ function startRuntime() {
     const message = failure || `AutoGPT stopped unexpectedly (exit code ${code}).`;
     if (!failure) report({ event: "error", fatal: true, message });
     if (mainWindow) explainCrash(message);
+    else lookForAFixedVersion();
   });
   started.start();
 }
@@ -94,9 +116,151 @@ function onRuntimeEvent(event) {
   report(event);
   if (event.event === "ready" && typeof event.url === "string") {
     appUrl = event.url;
-    refreshMenus();
     openMainWindow();
+    // Not before the first `ready`: migrations are over by then.
+    theUpdater()?.arm();
+    refreshMenus();
   }
+}
+
+// AutoGPT could not start and its runtime has exited. If that is this
+// version's fault, the fix is a newer version, and the user must not have
+// to go and find it: look once, now, and offer it next to the error.
+function lookForAFixedVersion() {
+  theUpdater()?.check();
+  refreshMenus();
+}
+
+// See updater.js for when the app looks for updates and what it accepts.
+// Null when this build does not update itself, and when electron-updater
+// cannot be started: updating is optional, the app is not.
+function theUpdater() {
+  if (updaterStarted) return updater;
+  updaterStarted = true;
+  try {
+    updater = startUpdater();
+  } catch (error) {
+    fileLogger(path.join(logsDir, "updater.log")).error(`Updates are off: ${error.stack || error}`);
+  }
+  return updater;
+}
+
+function startUpdater() {
+  const mode = updateMode({
+    version: app.getVersion(),
+    isPackaged: app.isPackaged,
+    platform: process.platform,
+    env: process.env,
+    macDeveloperId: Boolean(require("../package.json").autogptDesktop?.macDeveloperId),
+    appPath: app.getAppPath(),
+  });
+  if (mode === "off") return null;
+  // electron-updater says so on Electron's own updater, immediately before
+  // it quits the app.
+  require("electron").autoUpdater.on("before-quit-for-update", () => {
+    quitIsForUpdate = true;
+  });
+  return createUpdater({
+    autoUpdater: chooseAutoUpdater(require("electron-updater"), { platform: process.platform, env: process.env }),
+    mode,
+    logger: fileLogger(path.join(logsDir, "updater.log")),
+    onChange: onUpdateState,
+    needsDownloadedFile: installsFromDownloadedFile(process.platform),
+  });
+}
+
+function onUpdateState({ phase, version }) {
+  refreshMenus();
+  sendUpdateOffer();
+  if (phase === "failed" && installingUpdate) {
+    return resumeAfterFailedUpdate("The update could not be installed. Starting AutoGPT again…");
+  }
+  if (phase !== "ready" && phase !== "available") return;
+  if (!Notification.isSupported()) return;
+  const body =
+    phase === "ready"
+      ? "Choose Restart to update in the AutoGPT menu when it suits you."
+      : "Open the AutoGPT menu to download it.";
+  new Notification({ title: `AutoGPT ${version} is available`, body }).show();
+}
+
+// Stops the runtime as a quit does, which waits out a database migration,
+// and only then lets the installer replace the app.
+async function restartToUpdate() {
+  if (quitting || restarting || confirmingUpdate || updater?.state().phase !== "ready") return;
+  confirmingUpdate = true;
+  try {
+    if (!(await userWantsTheUpdate())) return;
+  } finally {
+    confirmingUpdate = false;
+  }
+  quitting = true;
+  installingUpdate = true;
+  appUrl = null;
+  history.length = 0;
+  // On macOS the new version is only unpacked now, which takes a while.
+  history.push({ event: "progress", message: "Installing the update…" });
+  showProgressInsteadOfTheApp();
+  await runtime?.stop().catch(() => {});
+  // The AppImage starts the new version before this one has gone, and a
+  // second instance quits at once while the first holds the lock.
+  if (process.platform === "linux") app.releaseSingleInstanceLock();
+  if (!updater.install()) resumeAfterFailedUpdate("The update has to be downloaded again. Starting AutoGPT again…");
+  refreshMenus();
+}
+
+// Asks, but only for a version that is still the latest release and whose
+// download is still there (updater.js looks once more). The answer counts
+// only if nothing changed while the question was on screen.
+async function userWantsTheUpdate() {
+  if (!(await updater.stillReady())) return false;
+  const { version } = updater.state();
+  const question = {
+    type: "question",
+    message: `Restart AutoGPT to update to ${version}?`,
+    detail: "Agents that are running now will be stopped.",
+    buttons: ["Restart", "Later"],
+    defaultId: 0,
+    cancelId: 1,
+  };
+  const parent = mainWindow || startupWindow;
+  const { response } = await (parent ? dialog.showMessageBox(parent, question) : dialog.showMessageBox(question));
+  const { phase, version: current } = updater.state();
+  return response === 0 && !quitting && !restarting && phase === "ready" && current === version;
+}
+
+// The installer was not started, or could not be: the old version is
+// intact, so run it. electron-updater may already have asked the app to
+// quit; `before-quit` drops that request (dropsUpdaterQuit).
+function resumeAfterFailedUpdate(message) {
+  installingUpdate = false;
+  quitting = false;
+  if (process.platform === "linux") app.requestSingleInstanceLock();
+  failure = null;
+  history.length = 0;
+  history.push({ event: "progress", message });
+  showProgressInsteadOfTheApp();
+  startRuntime();
+}
+
+// What the startup window shows next to a failed start (updater.js).
+function sendUpdateOffer() {
+  startupWindow?.webContents.send("update-offer", failedStartOffer(updater?.state()));
+}
+
+function takeUpdateOffer() {
+  const offer = failedStartOffer(updater?.state());
+  if (offer?.action === "install") restartToUpdate();
+  if (offer?.action === "open") shell.openExternal(releaseUrl(updater.state().version));
+}
+
+function updateItems() {
+  return updateMenuItems({
+    state: updater?.state(),
+    check: () => updater.check(),
+    install: restartToUpdate,
+    openRelease: (version) => shell.openExternal(releaseUrl(version)),
+  });
 }
 
 function report(event) {
@@ -125,6 +289,7 @@ function showStartupWindow() {
   startupWindow.once("ready-to-show", () => startupWindow.show());
   startupWindow.webContents.on("did-finish-load", () => {
     for (const event of history) startupWindow?.webContents.send("runtime-event", event);
+    sendUpdateOffer();
   });
   startupWindow.on("closed", () => {
     startupWindow = null;
@@ -247,7 +412,8 @@ async function explainCrash(message) {
 // The tray icon can be hidden or missing, so its owner actions are in the
 // application menu as well (owner.js; outside macOS it shows on Alt).
 function applicationMenu() {
-  return Menu.buildFromTemplate(applicationMenuTemplate(process.platform, ownerItems()));
+  const template = applicationMenuTemplate(process.platform, ownerItems());
+  return Menu.buildFromTemplate(withUpdatesMenu(template, updateItems(), process.platform));
 }
 
 function focusWindow() {
@@ -273,6 +439,7 @@ function trayMenu() {
     { type: "separator" },
     ...ownerItems(),
     { type: "separator" },
+    ...updateItems(),
     { label: "Quit AutoGPT", click: () => app.quit() },
   ]);
 }
@@ -293,10 +460,14 @@ function refreshMenus() {
 
 ipcMain.on("open-logs", () => shell.openPath(logsDir));
 ipcMain.on("quit", () => app.quit());
+ipcMain.on("take-update-offer", takeUpdateOffer);
 
 app.on("window-all-closed", () => {});
 
 app.on("before-quit", (event) => {
+  const dropped = dropsUpdaterQuit({ quitIsForUpdate, installing: installingUpdate });
+  quitIsForUpdate = false;
+  if (dropped) return event.preventDefault();
   if (quitting || !runtime) return;
   event.preventDefault();
   quitting = true;

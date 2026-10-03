@@ -20,6 +20,8 @@
       .failed #actions { display: flex; }
       #hint { color: var(--muted); font-size: 12px; }
       .failed #hint { display: none; }
+      button[hidden] { display: none; }
+      #update { border-color: var(--accent); }
       button { font: inherit; padding: 6px 14px; border-radius: 6px; border: 1px solid var(--muted); background: transparent; color: var(--fg); cursor: pointer; }
     </style>
   </head>
@@ -29,6 +31,7 @@
     <div id="message">Starting…</div>
     <div id="hint">The first start sets up a local database and can take a few minutes.</div>
     <div id="actions">
+      <button id="update" hidden></button>
       <button id="logs">Show logs</button>
       <button id="quit">Quit</button>
     </div>

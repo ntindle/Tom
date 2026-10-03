@@ -1,7 +1,7 @@
 {
   "name": "autogpt",
   "productName": "AutoGPT",
-  "version": "0.1.0",
+  "version": "0.0.0-dev.0",
   "private": true,
   "description": "Experimental desktop distribution of the AutoGPT Platform",
   "homepage": "https://agpt.co",
@@ -11,72 +11,14 @@
   "scripts": {
     "start": "electron .",
     "test": "node --test \"test/*.test.js\"",
-    "dist": "electron-builder --publish never",
-    "dist:dir": "electron-builder --dir --publish never"
+    "dist": "electron-builder --config electron-builder.config.js --publish never",
+    "dist:dir": "electron-builder --config electron-builder.config.js --dir --publish never"
+  },
+  "dependencies": {
+    "electron-updater": "6.8.9"
   },
   "devDependencies": {
     "electron": "44.5.1",
     "electron-builder": "26.15.3"
-  },
-  "build": {
-    "appId": "co.agpt.autogpt.desktop",
-    "productName": "AutoGPT",
-    "directories": {
-      "output": "dist",
-      "buildResources": "resources"
-    },
-    "files": [
-      "src/**/*",
-      "package.json"
-    ],
-    "extraResources": [
-      {
-        "from": "build/runtime",
-        "to": "runtime",
-        "filter": [
-          "**/*"
-        ]
-      }
-    ],
-    "asar": true,
-    "win": {
-      "target": [
-        {
-          "target": "nsis",
-          "arch": [
-            "x64"
-          ]
-        }
-      ]
-    },
-    "nsis": {
-      "oneClick": true,
-      "perMachine": false,
-      "deleteAppDataOnUninstall": false,
-      "artifactName": "AutoGPT-Setup-${version}-${arch}.${ext}"
-    },
-    "mac": {
-      "target": [
-        {
-          "target": "dmg",
-          "arch": [
-            "arm64"
-          ]
-        }
-      ],
-      "category": "public.app-category.productivity",
-      "artifactName": "AutoGPT-${version}-${arch}.${ext}",
-      "identity": "-",
-      "hardenedRuntime": false,
-      "gatekeeperAssess": false
-    },
-    "linux": {
-      "target": [
-        "AppImage",
-        "deb"
-      ],
-      "category": "Utility",
-      "artifactName": "AutoGPT-${version}-${arch}.${ext}"
-    }
   }
 }
