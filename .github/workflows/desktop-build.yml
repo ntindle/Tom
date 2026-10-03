@@ -248,12 +248,24 @@ jobs:
       run:
         shell: bash
     steps:
+      # One system gets the whole history, for the test below that needs it.
       - name: Check out ${{ inputs.ref }}
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ github.repository }}
           ref: ${{ inputs.ref }}
+          fetch-depth: ${{ matrix.os == 'ubuntu-22.04' && '0' || '1' }}
           persist-credentials: false
+
+      # runtime/tests/test_fork_surface.py holds `desktop` to differing from
+      # upstream only inside autogpt_platform/desktop. It finds upstream by
+      # this URL and skips, saying so, where it has no upstream to compare
+      # with: the other two systems.
+      - name: Fetch upstream to compare with
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          git remote add upstream https://github.com/Significant-Gravitas/AutoGPT.git
+          git fetch --no-tags upstream +refs/heads/dev:refs/remotes/upstream/dev
 
       - name: Set up Node
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0

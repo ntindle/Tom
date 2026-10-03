@@ -102,6 +102,21 @@ def test_the_gate_runs_the_same_tests_as_the_build() -> None:
         assert command in gate and command in unit
 
 
+def test_one_unit_job_can_compare_the_commit_with_upstream() -> None:
+    """The fork-surface test in the desktop tree skips without an upstream
+    ref, so a pull request that edits upstream's files would pass unseen."""
+    unit = job(workflow("desktop-build.yml"), "unit")
+    assert "fetch-depth: ${{ matrix.os == 'ubuntu-22.04' && '0' || '1' }}" in unit
+    fetch = next(
+        step for step in steps(unit) if step_name(step) == "Fetch upstream to compare with"
+    )
+    assert "if: matrix.os == 'ubuntu-22.04'" in fetch
+    assert "https://github.com/Significant-Gravitas/AutoGPT.git" in fetch
+    assert "+refs/heads/dev:refs/remotes/upstream/dev" in fetch
+    names = [step_name(step) for step in steps(unit)]
+    assert names.index("Fetch upstream to compare with") < names.index("Runtime tests")
+
+
 def test_every_gating_step_uses_bash_so_a_pipe_cannot_hide_a_failure() -> None:
     piped = [step for step in steps(job(SYNC, "gate")) if "| tee" in step]
     assert [step.splitlines()[0] for step in piped] == [
