@@ -20,9 +20,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+import bundled_tools
+import elf
 import erlang_patches
 import frontend_role_sql
 import lock_export
+import next_config
 from artifacts import ARTIFACTS, CLAUDE_CLI_VERSION, platform_key
 from fetch import download, extract
 
@@ -31,6 +34,15 @@ PLATFORM = DESKTOP.parent
 REPO = PLATFORM.parent
 WINDOWS = sys.platform == "win32"
 EXE = ".exe" if WINDOWS else ""
+# The Prisma engines a Linux bundle carries, whatever the build machine has:
+# the CLI picks by the first libssl it finds, and on a machine with OpenSSL 1.1
+# and 3 both installed (GitHub's ubuntu-22.04) that is 1.1, which the systems
+# the app is for (README: OpenSSL 3) no longer have.
+LINUX_ENGINE_TARGETS = {
+    "linux-x64": "debian-openssl-3.0.x",
+    "linux-arm64": "linux-arm64-openssl-3.0.x",
+}
+OPENSSL = "libssl.so.3"
 
 # Build-time settings of the frontend, identical to the appliance image
 # (single-container/Dockerfile): every browser-facing URL is same-origin and
@@ -152,6 +164,11 @@ class Build:
                 [str(scripts), str(self.python.parent), str(self.node.parent), os.environ["PATH"]]
             ),
         }
+        target = LINUX_ENGINE_TARGETS.get(platform_key())
+        if target:
+            # Read by the CLI's install script and by the CLI itself, in place
+            # of the platform they would detect (@prisma/engines).
+            env["PRISMA_CLI_BINARY_TARGETS"] = target
         run([str(self.python), "-m", "prisma", "generate"], cwd=self.out / "backend", env=env)
 
         target = self.out / "prisma"
@@ -166,14 +183,7 @@ class Build:
         )
         engines = modules / "@prisma" / "engines"
         for kind in ("query-engine", "schema-engine"):
-            # e.g. query-engine-windows.exe, query-engine-darwin-arm64,
-            # query-engine-debian-openssl-3.0.x (not the .node library builds).
-            engine = _single(
-                path
-                for path in engines.glob(f"{kind}-*")
-                if not path.name.endswith((".node", ".gz", ".sha256", ".tmp"))
-            )
-            shutil.copy2(engine, target / f"{kind}{EXE}")
+            shutil.copy2(fetched_engine(engines, kind, platform_key()), target / f"{kind}{EXE}")
 
     # --- infrastructure ---------------------------------------------------
 
@@ -301,9 +311,17 @@ class Build:
         shutil.copytree(frontend / ".next" / "standalone", target, symlinks=False)
         shutil.copytree(frontend / ".next" / "static", target / ".next" / "static")
         shutil.copytree(frontend / "public", target / "public")
-        shutil.rmtree(target / ".next" / "cache", ignore_errors=True)
         # webpack's build cache is several GB and only speeds up a rebuild.
         shutil.rmtree(frontend / ".next" / "cache", ignore_errors=True)
+        self.step_frontend_config()
+
+    def step_frontend_config(self) -> None:
+        """Keep the Next server from writing its caches into the bundle
+        (next_config.py). A step of its own so that it can be applied to a
+        frontend that is already built."""
+        target = self.out / "frontend"
+        shutil.rmtree(target / ".next" / "cache", ignore_errors=True)
+        next_config.keep_caches_off_disk(target)
 
     def _pnpm(self, env: dict[str, str]) -> list[str]:
         if WINDOWS:
@@ -420,6 +438,11 @@ class Build:
             encoding="utf-8",
         )
 
+    def step_tools(self) -> None:
+        """Programs the backend runs by name, in tools/bin (bundled_tools.py)."""
+        ffmpeg = bundled_tools.install_ffmpeg(self.out, self.cache)
+        print(f"  {ffmpeg.relative_to(self.out)}: {bundled_tools.inspect(ffmpeg).version}")
+
     def step_compile(self) -> None:
         """Ship bytecode. uv installs none, and the installed bundle is
         read-only, so without this every service would recompile every module
@@ -455,6 +478,94 @@ class Build:
         for compiled in self.out.rglob("*.pyc"):
             if len(str(compiled.relative_to(self.out))) > MAX_RELATIVE_PATH:
                 compiled.unlink()
+
+
+    # --- last ------------------------------------------------------------
+
+    def step_seal(self) -> None:
+        """Leave the bundle as an installed app must find it, and refuse to
+        call it assembled otherwise. A bundle that has been run from by an
+        older build of the runtime has what that run wrote into it; a bundle
+        that would write into itself again must not be packaged."""
+        shutil.rmtree(self.out / "frontend" / ".next" / "cache", ignore_errors=True)
+        for stray in downloaded_engines(self.out / "prisma" / "node_modules"):
+            stray.unlink()
+        next_config.check(self.out / "frontend")
+        unread = unread_by_prisma_cli(self.out / "prisma" / "node_modules")
+        if unread:
+            raise RuntimeError(
+                f"the bundled Prisma CLI no longer reads {', '.join(unread)}, which is how "
+                "the runtime keeps it from downloading engines on the user's machine. Read "
+                "how this version finds its engines (@prisma/engines ensureBinariesExist, "
+                "@prisma/fetch-engine download) and update "
+                "desktop/runtime/autogpt_desktop/migrations.py."
+            )
+        for kind in ("query-engine", "schema-engine"):
+            engine = self.out / "prisma" / f"{kind}{EXE}"
+            if not engine.is_file():
+                raise RuntimeError(f"the bundle has no prisma/{kind}{EXE}; run the prisma step")
+            if sys.platform.startswith("linux"):
+                problem = wrong_openssl(elf.needed(engine))
+                if problem:
+                    raise RuntimeError(f"prisma/{kind} {problem}; run the prisma step again")
+        bundled_tools.check(self.out)
+
+
+def fetched_engine(engines: Path, kind: str, platform: str) -> Path:
+    """The executable engine the Prisma CLI downloaded for this platform
+    (not the .node library builds): query-engine-windows.exe,
+    query-engine-darwin-arm64, and on Linux the one named for OpenSSL 3 and
+    no other, even when the download cache holds others."""
+    target = LINUX_ENGINE_TARGETS.get(platform)
+    if not target:
+        return _single(
+            path
+            for path in engines.glob(f"{kind}-*")
+            if not path.name.endswith((".node", ".gz", ".sha256", ".tmp"))
+        )
+    engine = engines / f"{kind}-{target}"
+    if not engine.is_file():
+        raise RuntimeError(
+            f"the Prisma CLI did not fetch {engine.name} into {engines}. It is told which "
+            "to fetch through PRISMA_CLI_BINARY_TARGETS; if this version of the CLI no "
+            "longer reads that, update step_prisma."
+        )
+    return engine
+
+
+def wrong_openssl(needed: list[str]) -> str | None:
+    """What is wrong with the libraries a Linux Prisma engine is linked
+    against, if it is not OpenSSL 3 alone."""
+    linked = sorted(name for name in needed if name.startswith("libssl.so"))
+    if linked == [OPENSSL]:
+        return None
+    found = ", ".join(linked) or "no libssl at all"
+    return f"is linked against {found}, and the bundle is for systems with {OPENSSL}"
+
+
+def downloaded_engines(node_modules: Path) -> list[Path]:
+    """Engines the Prisma CLI fetched into its own package while it ran (the
+    build copies none there: step_prisma, step_prune), and its download
+    cache."""
+    engines = node_modules / "@prisma" / "engines"
+    patterns = ("*.node", "*-engine-*", "*.gz", "*.sha256", "*.tmp")
+    return sorted(
+        path for pattern in patterns for path in engines.glob(pattern) if path.is_file()
+    )
+
+
+def unread_by_prisma_cli(node_modules: Path) -> list[str]:
+    """Of the variables the runtime steers the Prisma CLI with, those the
+    CLI's engine handling no longer mentions."""
+    sys.path.insert(0, str(DESKTOP / "runtime"))
+    from autogpt_desktop.migrations import READ_BY_THE_CLI
+
+    code = "".join(
+        path.read_text(encoding="utf-8", errors="replace")
+        for package in ("engines", "fetch-engine")
+        for path in sorted((node_modules / "@prisma" / package / "dist").rglob("*.js"))
+    )
+    return [name for name in READ_BY_THE_CLI if name not in code]
 
 
 # The install prefix on Windows is at most 80 characters
@@ -495,10 +606,13 @@ STEPS = (
     "rabbitmq",
     "erlang_patches",
     "frontend",
+    "frontend_config",
     "assets",
     "prune",
     "relocate",
+    "tools",
     "compile",
+    "seal",
 )
 
 

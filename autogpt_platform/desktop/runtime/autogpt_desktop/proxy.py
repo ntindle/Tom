@@ -19,6 +19,7 @@ machine, which a browser would otherwise mix up (cookies.py).
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import threading
 from dataclasses import dataclass
@@ -27,6 +28,8 @@ import aiohttp
 from aiohttp import web
 
 from autogpt_desktop import cookies, install
+
+logger = logging.getLogger("autogpt_desktop")
 
 HOP_BY_HOP = {
     "connection",
@@ -240,6 +243,7 @@ class ProxyThread:
 
     def _run(self) -> None:
         asyncio.set_event_loop(self.loop)
+        self.loop.set_exception_handler(_report_loop_error)
         try:
             # The window's websocket is still open when the app quits, and
             # aiohttp would wait a minute for it to finish on its own.
@@ -255,3 +259,22 @@ class ProxyThread:
             return
         self.started.set()
         self.loop.run_forever()
+
+
+def _report_loop_error(loop: asyncio.AbstractEventLoop, context: dict) -> None:
+    if client_went_away(context):
+        logger.debug("a connection was dropped by its other end: %s", context.get("exception"))
+        return
+    loop.default_exception_handler(context)
+
+
+def client_went_away(context: dict) -> bool:
+    """Whether what the event loop reports is only a connection its other
+    end dropped: a closed tab, a cancelled request, a service that let go of
+    an idle connection. On Windows the loop finds out when it shuts its own
+    end down, inside the transport's connection-lost callback, and reports it
+    as an error with a traceback each time. Nothing was lost; anything else
+    still goes to the default handler."""
+    reset = isinstance(context.get("exception"), ConnectionResetError | ConnectionAbortedError)
+    source = f"{context.get('message', '')} {context.get('handle', '')}"
+    return reset and "_call_connection_lost" in source

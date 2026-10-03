@@ -123,7 +123,73 @@ is set explicitly, as the appliance does.
 | Node 24, Prisma 5.17 engines | upstream | upstream | upstream |
 
 The Linux bundle needs glibc 2.35 and OpenSSL 3 (Ubuntu 22.04, Debian 12,
-Fedora 36, or newer). The AppImage also needs FUSE 2 (`libfuse2` on Ubuntu).
+Fedora 36, or newer); on a system without OpenSSL 3 the app stops at its
+first start and says so. The build fetches the Prisma engines made for
+OpenSSL 3 whatever the build machine has installed, and refuses to seal a
+bundle whose engines are linked against anything else. The AppImage also
+needs FUSE 2 (`libfuse2` on Ubuntu).
+
+**The bundle is never written to.** Installed, it is read-only (a `.deb`, a
+mounted AppImage) or sealed by a code signature (macOS), so everything the
+app writes goes to the data directory:
+
+- The Next server would keep three caches beside its own code (optimised
+  images, `fetch` responses, regenerated pages). The build switches them off
+  in the server's embedded configuration (`build/next_config.py`) and raises
+  the time a browser may keep an optimised image from one minute to four
+  hours, since the server no longer has a copy to answer from. A remote
+  image replaced under the same URL can be that stale.
+- The Prisma CLI, which applies migrations, would download a query engine
+  for the platform it detects into its own package. It is told to use the
+  two engines the bundle carries and touches nothing else
+  (`runtime/autogpt_desktop/migrations.py`).
+- The interpreter runs with `-B`, on bytecode the build compiled.
+- The backend's optional file logging (`ENABLE_FILE_LOGGING` in
+  `settings.env`) goes to `logs/backend` in the data directory.
+
+The smoke test fails on any file or directory a run adds, changes or removes
+in the bundle, and on Linux and macOS can run with the whole bundle
+unwritable (see [Building](#building)).
+
+**Paths with spaces.** RabbitMQ's launch scripts cannot take a space in any
+path, and both the bundle and the data directory usually have one. On macOS
+and Linux they are given a symlink under the user's cache directory. On
+Windows they are given the folder's 8.3 short name; on a volume that keeps
+no short names (any drive but the system one, by default), a directory
+junction instead (`runtime/autogpt_desktop/winlinks.py`). Junctions live in
+`%LOCALAPPDATA%\<install>\links` when that path is itself free of spaces,
+and otherwise in `%ProgramData%\<install>-<user SID>`, a folder created
+open to its user, the system and administrators only. One that is already
+there is used only when it is a real folder, owned by one of those three,
+that nobody else may change; all three facts are read from one open handle,
+which also keeps the folder from being renamed while the junction is made.
+RabbitMQ and Erlang are run, and read their configuration and cookie,
+through the junctions, so another user of the machine must not be able to
+point one elsewhere. Junctions whose folder is gone are removed at the next
+start.
+
+**PostgreSQL on Windows** is started through `pg_ctl start` for every user.
+`postgres.exe` refuses to run for an account with administrative rights (an
+elevated shell, a CI runner), and `pg_ctl` starts it with those rights taken
+away. `pg_ctl` does not stay, so the runtime watches, records and stops the
+server it finds through `postmaster.pid`; the server is still inside the
+runtime's Job Object. macOS and Linux start `postgres` directly.
+
+**Bundled tools.** `tools/bin` in the bundle is first on the backend
+services' `PATH`. It holds `ffmpeg`, which the video blocks, the video
+download block (yt-dlp) and recording transcription run by name: the binary
+that the backend's own `imageio-ffmpeg` dependency ships, moved to where a
+plain `ffmpeg` finds it (`build/bundled_tools.py`). Each OS's wheel carries a
+different build by a different builder (gyan.dev, johnvansickle.com,
+osxexperts.net), so the build asks the binary what it is, checks that it is
+that builder's, and ships the licence text and a note of where its source
+is in `tools/licenses/ffmpeg`. All three are GPL builds and go out under
+GPL version 3; the macOS one is "version 2 or later", so both texts are
+shipped with it. A build that may not be redistributed, or whose builder is
+not the recorded one, fails the `tools` step, and `seal` refuses a bundle
+whose ffmpeg lacks its licence or note.
+There is no `ffprobe`: nothing in the backend needs it, and yt-dlp merges
+separate video and audio streams into an mp4 without it.
 
 ## Where data lives
 
@@ -542,8 +608,13 @@ names a version; the other settings are at the top of
 
 `build_runtime.py` is a list of independent steps; `--only frontend,assets`
 re-runs some of them. The frontend must be built on the OS it will run on.
+The last step, `seal`, removes what a run from the bundle may have left in
+it and refuses a bundle that would write into itself or fetch anything when
+installed; run it again before packaging a bundle that has been run from.
 `build/smoke_test.py` boots an assembled bundle, probes it and checks that
-stopping it leaves no process behind and no file in the bundle changed. It
+stopping it leaves no process behind and nothing in the bundle changed
+(a file that came and went during the run shows in its directory's
+modification time). It
 starts the bundle three times on one data directory to prove the owner
 account end to end (first sign-up is an admin; registration is closed after
 a restart; a password reset takes effect); `--quick` stops after the first:
@@ -563,6 +634,16 @@ service host's log must show that it was asked, that its services' cleanup
 ran, and that it left by itself. `--profile isolated` runs all of it with a
 process per service.
 
+The runtime is started with no way out to the network through a proxy, so
+a migration that tried to download an engine would fail. The data directory
+is a temporary one, removed when the run ends, also when the run is
+interrupted or told to end; `--data-dir` names one to use and keep, `--keep`
+keeps the temporary one. The links a run made for paths with spaces are
+removed either way. On macOS and Linux,
+`--read-only` takes write permission off the whole bundle for the run, as a
+system-wide install has it, and also fails on any service log that mentions
+a refused write (not as root, whom permissions do not stop).
+
 On Windows the bundled Valkey is built separately, inside MSYS2, into
 `build/.cache/valkey-windows`:
 
@@ -574,7 +655,8 @@ Without it the build stops. `--redis-stand-in` bundles a Redis build instead,
 for local work only: it is not BSD-licensed, and Valkey cannot read the files
 it writes.
 
-Every download is pinned by SHA-256 in `build/artifacts.py`.
+Every download is pinned by SHA-256 in `build/artifacts.py` (the licence
+texts shipped with ffmpeg, in `build/bundled_tools.py`).
 
 ## Tests
 
@@ -640,13 +722,11 @@ It prints one JSON object per line (`progress`, `ready` with the URL,
   than 24 hours ago (the interrupted step runs again); an older one is marked
   failed. There is no "runs are in progress" prompt yet, and no way to stop
   a run for good as the app closes.
-- `ffmpeg`, ImageMagick and a browser for AutoPilot's browsing tool are not
-  bundled; the blocks and tools that need them fail without them.
-- Two things are written into the install directory, which the appliance
-  redirects with symlinks and this does not yet: saved admin settings
-  (`backend/config.json`) and the Next image cache. Neither survives an
-  upgrade, and a read-only install (the `.deb`) cannot write them at all.
+- ImageMagick and a browser for AutoPilot's browsing tool are not bundled;
+  the tools that need them fail without them.
 - The Memory settings page talks to FalkorDB, which is not there.
-- Do not run it as Administrator on Windows: PostgreSQL refuses to start.
+- Running it as Administrator on Windows has not been tried on a real
+  machine. PostgreSQL is started in the way that works for such an account
+  (see above), from an ordinary account so far.
 - A Windows user name longer than 20 characters can push bundled files past
   the 260-character path limit.

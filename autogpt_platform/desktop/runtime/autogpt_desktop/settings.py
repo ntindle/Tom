@@ -12,6 +12,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import logging
+import os
 import secrets
 import sys
 from pathlib import Path
@@ -114,6 +115,10 @@ def backend_environment(
     env = {
         **(defaults or {}),
         **user,
+        **_bundled_tools(bundle),
+        # Where the backend's file logging goes if settings.env turns it on.
+        # Its default is a `logs` directory beside the code: in the bundle.
+        "LOG_DIR": str(data.logs / "backend"),
         "AUTOGPT_PUBLIC_URL": public_url,
         "APP_ENV": "dev",
         "BEHAVE_AS": "local",
@@ -192,6 +197,22 @@ def backend_environment(
         **_service_addresses(ports),
     }
     return env
+
+
+def _bundled_tools(bundle: Bundle) -> dict[str, str]:
+    """ffmpeg, for the three ways the backend looks for it: by name on PATH
+    (its own subprocess calls, and yt-dlp's), and through imageio-ffmpeg,
+    which reads IMAGEIO_FFMPEG_EXE before anything else. The bundle's
+    directory goes first on PATH, so the app behaves the same whatever the
+    machine has installed. Nothing is set for a bundle without the tool:
+    imageio-ffmpeg then still finds a copy of its own, or the system's."""
+    if not bundle.ffmpeg.is_file():
+        logger.warning(f"the bundle has no {bundle.ffmpeg.name}; video tools may not work")
+        return {}
+    return {
+        "PATH": os.pathsep.join([str(bundle.tools_bin), os.environ.get("PATH", "")]),
+        "IMAGEIO_FFMPEG_EXE": str(bundle.ffmpeg),
+    }
 
 
 def closes_registration(configured: str | None) -> bool:

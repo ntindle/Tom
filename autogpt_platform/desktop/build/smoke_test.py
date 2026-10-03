@@ -2,12 +2,13 @@
 
     <runtime>/python/python smoke_test.py <runtime> [--timeout 600] [--quick]
                                           [--profile compact|balanced|isolated]
+                                          [--data-dir DIR] [--keep] [--read-only]
 
 Run it with the bundle's own interpreter (it uses psutil, psycopg2 and redis
 from the bundle). This is the shell's contract exercised without the shell:
 start the runtime as the bundle's manifest says to, read JSON events from
-stdout until `ready`, close stdin, expect exit code 0, no process from the
-bundle left running, and no file in the bundle changed.
+stdout until `ready`, close stdin, expect exit code 0, no process it started
+left running, and no file in the bundle changed.
 
 Before anything is started, the backend in the bundle is checked against
 what the service host depends on (runtime/tests/backend_contract.py).
@@ -33,6 +34,22 @@ Every start must come up on the address the first one had: sessions and OAuth
 redirect URLs hang off it.
 
 `--quick` stops after the first.
+
+The bundle is the installed app's, so a run may leave nothing in it: no file
+or directory added, changed or removed (the Next server's caches are probed
+on purpose), and nothing fetched. The runtime is started with every proxy
+variable pointing at a closed port, which the Prisma CLI (the one part of the
+stack that would download something, an engine, when it found none it liked)
+inherits: a download fails the migration instead of quietly succeeding.
+`--read-only` (macOS and Linux) goes further and takes write permission off
+the whole bundle for the run, as a system-wide install or a mounted AppImage
+has it, then also fails on any service log that mentions being refused.
+
+Without `--data-dir` the data directory is a temporary one, removed when the
+run ends, however it ends (a signal that asks it to end included); `--keep`
+leaves it. One given with `--data-dir` is the caller's and is left alone.
+Either way, the space-free links the runtime made outside the data directory
+during the run are removed (autogpt_desktop/rabbitmq.py).
 """
 
 from __future__ import annotations
@@ -44,6 +61,8 @@ import io
 import json
 import os
 import re
+import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -86,6 +105,24 @@ CATALOG_NOT_BEFORE_SECONDS = 55
 CATALOG_SECONDS = 420
 STALE_LOCK = "exec_lock:left-by-the-smoke-test"
 
+# Nothing listens on the discard port. What the runtime starts with these in
+# its environment cannot reach the network through a proxy-aware client; its
+# own services are on loopback and exempt.
+CLOSED_PROXY = "http://127.0.0.1:9"
+NO_WAY_OUT = {
+    "HTTPS_PROXY": CLOSED_PROXY,
+    "HTTP_PROXY": CLOSED_PROXY,
+    "NO_PROXY": "127.0.0.1,localhost",
+}
+if sys.platform != "win32":  # where the two spellings are two variables
+    NO_WAY_OUT.update({name.lower(): value for name, value in NO_WAY_OUT.items()})
+# A public image, small, and of a width the Next configuration allows.
+OPTIMISED_IMAGE = "/_next/image?url=%2Fplaceholder.png&w=64&q=75"
+# What a service says when it is refused a write (--read-only).
+REFUSED_WRITE = re.compile(
+    r"EACCES|EROFS|EPERM|Read-only file system|Permission denied|Failed to write image to cache"
+)
+
 # The whole stack, idle: memory unique to its processes (USS; on macOS the
 # physical footprint), in MB. Measured on Windows x64, 2026-10-03: balanced
 # and compact (three service hosts) 2,900-3,000; isolated (eight) 5,900. The
@@ -114,6 +151,8 @@ class Install:
         # A run still going when the first start was stopped.
         self.in_flight: str | None = None
         self.quit_mid_run = False
+        # --read-only: puts the bundle's permissions back (see `unwritable`).
+        self.give_back: Callable[[], None] | None = None
 
 
 Checks = Callable[[str, Path, Install], list[str]]
@@ -128,6 +167,14 @@ def main() -> int:
         type=Path,
         help="use this (empty) data directory, e.g. one with a space in its path",
     )
+    parser.add_argument(
+        "--keep", action="store_true", help="do not remove the temporary data directory"
+    )
+    parser.add_argument(
+        "--read-only",
+        action="store_true",
+        help="macOS and Linux: run with the bundle unwritable, as an installed app has it",
+    )
     parser.add_argument("--quick", action="store_true", help="one start, no restarts")
     parser.add_argument(
         "--profile",
@@ -141,9 +188,61 @@ def main() -> int:
             stream.reconfigure(errors="replace")
     runtime = args.runtime.resolve()
     sys.path.append(str(runtime))  # for autogpt_desktop.apps, as the bundle has it
+    refused = cannot_run_read_only() if args.read_only else None
+    if refused:
+        print(refused)
+        return 2
+    end_on_signals()
     data = args.data_dir or Path(tempfile.mkdtemp(prefix="autogpt-smoke-"))
+    aliases = Aliases(runtime, data)
+    try:
+        with unwritable(runtime) if args.read_only else contextlib.nullcontext() as give_back:
+            return smoke(runtime, data, args, give_back)
+    finally:  # a failed check, an exception, Ctrl+C, a signal: the run is over
+        aliases.remove_new()
+        if not args.data_dir and not args.keep:
+            remove_data(data)
+
+
+END_SIGNALS = [
+    getattr(signal, name) for name in ("SIGINT", "SIGTERM", "SIGHUP") if hasattr(signal, name)
+]
+
+
+def end_on_signals() -> None:
+    """Being told to end (a CI job cancelled, `kill`) is a Ctrl+C: Python's
+    own answer to SIGTERM is to die at once, with the stack still running,
+    the data directory left and, with --read-only, the bundle unwritable."""
+
+    def interrupt(number: int, frame: object) -> None:
+        raise KeyboardInterrupt(signal.Signals(number).name)
+
+    for number in END_SIGNALS:
+        if number != signal.SIGINT:  # which already does this
+            signal.signal(number, interrupt)
+
+
+@contextlib.contextmanager
+def deaf_to_signals():
+    """For the one piece of clearing up that must not be cut short by a
+    second Ctrl+C or the signal that follows the first."""
+    previous = {}
+    for number in END_SIGNALS:
+        with contextlib.suppress(ValueError, OSError):  # not the main thread
+            previous[number] = signal.signal(number, signal.SIG_IGN)
+    try:
+        yield
+    finally:
+        for number, handler in previous.items():
+            signal.signal(number, handler)
+
+
+def smoke(
+    runtime: Path, data: Path, args: argparse.Namespace, give_back: Callable[[], None] | None = None
+) -> int:
     if args.profile:
         choose_profile(data, args.profile)
+    stale = left_by_earlier_runs(runtime)
     bundle_before = snapshot(runtime)
     starts: list[Checks] = [fresh_install]
     if not args.quick:
@@ -152,12 +251,16 @@ def main() -> int:
     started = time.monotonic()
     failures = backend_contract(runtime)
     install = Install(args.quick)
+    install.give_back = give_back
     for number, checks in enumerate(starts, start=1):
         if failures:
             break
         print(f"\n== start {number} of {len(starts)}: {checks.__name__.replace('_', ' ')}")
         failures += run(runtime, data, args.timeout, checks, install)
     failures += changed_files(bundle_before, snapshot(runtime))
+    failures += stale
+    if args.read_only:
+        failures += refused_writes(data)
 
     if failures:
         print("\nFAILED")
@@ -175,32 +278,288 @@ def run(runtime: Path, data: Path, timeout: int, checks: Checks, install: Instal
     process = subprocess.Popen(
         shell_command(runtime),
         cwd=runtime,
-        env={**os.environ, "AUTOGPT_DESKTOP_DATA_DIR": str(data)},
+        env={**os.environ, **NO_WAY_OUT, "AUTOGPT_DESKTOP_DATA_DIR": str(data)},
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         text=True,
         encoding="utf-8",
     )
+    failures: list[str] = []
     install.runtime = psutil.Process(process.pid)
-    url = wait_for_ready(process, timeout, started, install)
-    install.ready_at, install.ready_wall = time.monotonic(), time.time()
-    failures = [] if url else ["the runtime never reported ready"]
-    install.quit_mid_run = False
-    if url:
-        failures += checked(checks, url, data, install)
-    failures += stop(process)
-    if url:
-        failures += stopped_gracefully(data, install)
-
-    time.sleep(2)
-    leftovers = processes_from(runtime)
-    if leftovers:
-        names = sorted({leftover.info["name"] for leftover in leftovers})
-        failures.append(f"processes left running: {names}")
-        for leftover in leftovers:  # do not leave the machine dirty
-            with contextlib.suppress(psutil.Error):
-                leftover.kill()
+    family = Family(install.runtime, data, runtime)
+    try:
+        url = wait_for_ready(process, timeout, started, install)
+        install.ready_at, install.ready_wall = time.monotonic(), time.time()
+        failures += [] if url else ["the runtime never reported ready"]
+        install.quit_mid_run = False
+        if url:
+            failures += checked(checks, url, data, install)
+        failures += stop(process)
+        if url:
+            failures += stopped_gracefully(data, install)
+    finally:
+        if process.poll() is None:  # the smoke test itself is being ended
+            process.kill()
+            if install.give_back:  # first: what follows is slow, and may be cut short
+                install.give_back()
+        failures += left_running(family)
     return failures
+
+
+class Family:
+    """Every process the runtime started, directly or not, noted while it
+    ran: once the runtime is gone, what it left behind has no parent to be
+    found through. Told apart from anything else that runs from the bundle
+    at the same time (a developer's unit tests use its interpreter)."""
+
+    def __init__(self, runtime: psutil.Process, data: Path, bundle: Path) -> None:
+        self.runtime = runtime
+        self.born = runtime.create_time()
+        self.data = data
+        self.bundle = bundle
+        self.seen: set[psutil.Process] = set()
+        self.done = threading.Event()
+        self.watcher = threading.Thread(target=self.watch, name="family", daemon=True)
+        self.watcher.start()
+
+    def watch(self) -> None:
+        while not self.done.wait(1):
+            self.look()
+
+    def look(self) -> None:
+        with contextlib.suppress(psutil.Error):
+            self.seen.update(self.runtime.children(recursive=True))
+        for detached in nobodys_children(self.data, self.runtime):
+            with contextlib.suppress(psutil.Error):
+                # With the command prompt pg_ctl started it through.
+                launcher = [p for p in detached.parents()[:1] if born_under(p, self.runtime)]
+                self.seen.update([detached, *launcher, *detached.children()])
+
+    def still_running(self) -> list[psutil.Process]:
+        self.done.set()
+        self.watcher.join(10)
+        living = [process for process in self.seen if is_alive(process)]
+        return [*living, *self.strays(set(living))]
+
+    def strays(self, known: set[psutil.Process]) -> list[psutil.Process]:
+        """What left the family tree before it was looked at: a process that
+        makes itself a daemon (epmd does, left to itself) is nobody's child
+        within milliseconds. It runs from the bundle, was started after the
+        runtime, and is of this run by what it was started with: the data
+        directory, or a link to it, in its environment, on its command line
+        or as its working directory, which is true of every process of the
+        stack. Who its parent is now says nothing (an orphan is handed to
+        whatever the system has for that), and a developer's unit tests, also
+        running from the bundle, have none of the three."""
+        marks = [str(self.data), *(str(link) for link in links_to(self.data))]
+        found = []
+        for process in psutil.process_iter():
+            with contextlib.suppress(psutil.Error, OSError):
+                if process in known or process.pid == os.getpid():
+                    continue
+                if process.create_time() < self.born or not self.runs_from_bundle(process):
+                    continue
+                if mentions(process, marks):
+                    found.append(process)
+        return found
+
+    def runs_from_bundle(self, process: psutil.Process) -> bool:
+        executable = process.exe()
+        return bool(executable) and Path(executable).resolve().is_relative_to(self.bundle.resolve())
+
+
+def mentions(process: psutil.Process, marks: list[str]) -> bool:
+    """Whether a process was started with any of `marks` in its environment,
+    on its command line, or as the directory it works in."""
+    said: list[str] = []
+    for ask in (lambda: process.environ().values(), process.cmdline, lambda: [process.cwd()]):
+        with contextlib.suppress(psutil.Error, OSError):
+            said += ask()
+    return any(mark in value for mark in marks for value in said)
+
+
+def is_alive(process: psutil.Process) -> bool:
+    try:
+        return process.is_running() and process.status() != psutil.STATUS_ZOMBIE
+    except psutil.Error:
+        return False
+
+
+def left_running(family: Family) -> list[str]:
+    """What outlived the runtime, ended here so that the machine is not left
+    dirty."""
+    time.sleep(2)
+    leftovers = family.still_running()
+    if not leftovers:
+        return []
+    names = set()
+    for leftover in leftovers:
+        with contextlib.suppress(psutil.Error):
+            names.add(leftover.name())
+            leftover.kill()
+    psutil.wait_procs(leftovers, timeout=10)
+    return [f"processes left running: {sorted(names)}"]
+
+
+def remove_data(data: Path) -> None:
+    """The temporary data directory."""
+    for _ in range(10):  # a virus scanner may still hold a file just closed
+        with contextlib.suppress(OSError):
+            shutil.rmtree(data, onexc=_remove_read_only)
+        if not data.exists():
+            return
+        time.sleep(1)
+    print(f"could not remove {data}")
+
+
+def _remove_read_only(remove: Callable, path: str, error: BaseException) -> None:
+    """Windows refuses to delete a read-only file, and RabbitMQ's cookie is
+    one (written for its owner to read, and nobody to change)."""
+    os.chmod(path, stat.S_IREAD | stat.S_IWRITE)
+    remove(path)
+
+
+class Aliases:
+    """What a run keeps outside the data directory: the space-free links
+    RabbitMQ is given to the data directory and to the bundle when their
+    paths have a space in them (autogpt_desktop/rabbitmq.py; symlinks, or
+    junctions on Windows). Those that appear during the run and lead to
+    either are this run's, and go with it; so do the folders made to hold
+    them. A link that was there before, or that leads anywhere else, is
+    another install's or another run's."""
+
+    def __init__(self, runtime: Path, data: Path) -> None:
+        self.targets = [runtime, data]
+        self.roots = alias_roots()
+        self.new_folders = [
+            folder for root in self.roots for folder in (root, root.parent) if not folder.exists()
+        ]
+        self.before = set(self.links())
+
+    def links(self) -> list[Path]:
+        return [link for root in self.roots for link in links_in(root)]
+
+    def remove_new(self) -> None:
+        for link in set(self.links()) - self.before:
+            if any(leads_into(link, target) for target in self.targets):
+                remove_link(link)
+        for folder in self.new_folders:
+            with contextlib.suppress(OSError):
+                folder.rmdir()  # only when nothing else is in it
+
+
+def alias_roots() -> list[Path]:
+    from autogpt_desktop import rabbitmq
+
+    return rabbitmq.alias_roots()
+
+
+def links_in(root: Path) -> list[Path]:
+    try:
+        return [entry for entry in root.iterdir() if is_link(entry)]
+    except OSError:
+        return []
+
+
+def links_to(directory: Path) -> list[Path]:
+    """The links, in any of the places the runtime keeps them, that lead
+    into `directory`."""
+    return [
+        link for root in alias_roots() for link in links_in(root) if leads_into(link, directory)
+    ]
+
+
+def is_link(path: Path) -> bool:
+    return path.is_symlink() or path.is_junction()
+
+
+def leads_into(link: Path, directory: Path) -> bool:
+    """By where the link really goes, not by how either path is spelled
+    (/var and /private/var on macOS, an 8.3 name on Windows)."""
+    destination = Path(os.path.realpath(link))
+    return destination.is_relative_to(Path(os.path.realpath(directory)))
+
+
+def remove_link(link: Path) -> None:
+    with contextlib.suppress(OSError):
+        if link.is_symlink():
+            link.unlink()
+        else:
+            link.rmdir()  # a junction
+
+
+def cannot_run_read_only() -> str | None:
+    if sys.platform == "win32":
+        return "--read-only is for macOS and Linux; Windows installs per user, writable"
+    if os.geteuid() == 0:
+        return "--read-only proves nothing as root, whom permissions do not stop"
+    return None
+
+
+@contextlib.contextmanager
+def unwritable(runtime: Path):
+    """Write permission taken off every file and directory of the bundle,
+    and put back as it was. Yields the putting back, for a run that is being
+    ended to do first of all; done once, and not interruptible: a bundle
+    left unwritable fails the next build until someone repairs it by hand."""
+    modes = {}
+    for path in [runtime, *runtime.rglob("*")]:
+        if not path.is_symlink():
+            modes[path] = stat.S_IMODE(path.lstat().st_mode)
+    given_back = False
+
+    def give_back() -> None:
+        nonlocal given_back
+        if given_back:
+            return
+        with deaf_to_signals():
+            # Top down: a directory must be writable before what is in it can be.
+            for path, mode in modes.items():
+                with contextlib.suppress(OSError):
+                    path.chmod(mode)
+            given_back = True
+
+    try:
+        for path, mode in modes.items():
+            path.chmod(mode & ~0o222)
+        yield give_back
+    finally:
+        give_back()
+
+
+def refused_writes(data: Path) -> list[str]:
+    """Lines of the logs (the services', in any folder under logs/, and the
+    runtime's own) that speak of a refused write."""
+    found = []
+    logs = data / "logs"
+    for log in sorted(logs.rglob("*.log")):
+        lines = log.read_text(encoding="utf-8", errors="replace").splitlines()
+        refused = [line for line in lines if REFUSED_WRITE.search(line)]
+        if refused:
+            found.append(
+                f"{log.relative_to(logs).as_posix()} has {len(refused)} line(s) about a refused "
+                f"write with the bundle read-only, the first: {refused[0][:300]}"
+            )
+    return found
+
+
+def left_by_earlier_runs(runtime: Path) -> list[str]:
+    """What a run of an older runtime wrote into this bundle. The snapshot
+    is taken after it, so nothing else would notice, and it would be packaged
+    with the app."""
+    engines = runtime / "prisma" / "node_modules" / "@prisma" / "engines"
+    found = [
+        *[path for path in [runtime / "frontend" / ".next" / "cache"] if path.exists()],
+        *engines.glob("*.node"),
+    ]
+    if not found:
+        return []
+    listed = ", ".join(str(path.relative_to(runtime)) for path in found)
+    print(f"== left in the bundle by an earlier run: {listed}")
+    return [
+        f"the bundle already held what an earlier run wrote into it ({listed}); "
+        "`build_runtime.py --only seal` removes it"
+    ]
 
 
 def checked(checks: Checks, url: str, data: Path, install: Install) -> list[str]:
@@ -287,19 +646,31 @@ def stopped_gracefully(data: Path, install: Install) -> list[str]:
     return report.failures
 
 
-def snapshot(runtime: Path) -> dict[str, tuple[int, int]]:
-    """Size and modification time of every file in the bundle."""
-    files = {}
+Snapshot = dict[str, tuple[object, ...]]
+
+
+def snapshot(runtime: Path) -> Snapshot:
+    """Every entry of the bundle: a file by size and modification time; a
+    directory by its modification time, which moves when anything is created
+    in it or deleted from it, so a file that came and went during the run
+    shows; a link by where it points; anything else (a socket, a pipe) by
+    what it is."""
+    entries: Snapshot = {os.curdir + os.sep: ("directory", runtime.lstat().st_mtime_ns)}
     for path in runtime.rglob("*"):
         status = path.lstat()
-        if stat.S_ISREG(status.st_mode):
-            files[str(path.relative_to(runtime))] = (status.st_size, status.st_mtime_ns)
-    return files
+        name = str(path.relative_to(runtime))
+        if path.is_symlink() or path.is_junction():
+            entries[name] = ("link", os.readlink(path))
+        elif stat.S_ISREG(status.st_mode):
+            entries[name] = ("file", status.st_size, status.st_mtime_ns)
+        elif stat.S_ISDIR(status.st_mode):
+            entries[name + os.sep] = ("directory", status.st_mtime_ns)
+        else:
+            entries[name] = ("other", stat.S_IFMT(status.st_mode))
+    return entries
 
 
-def changed_files(
-    before: dict[str, tuple[int, int]], after: dict[str, tuple[int, int]]
-) -> list[str]:
+def changed_files(before: Snapshot, after: Snapshot) -> list[str]:
     """Running the app must leave its bundle exactly as it was: installed, the
     bundle may be read-only, and on macOS a changed file breaks the code
     signature."""
@@ -309,7 +680,7 @@ def changed_files(
     if not changed:
         return []
     listed = ", ".join(changed[:5]) + (" ..." if len(changed) > 5 else "")
-    return [f"the run changed {len(changed)} file(s) in the bundle: {listed}"]
+    return [f"the run changed {len(changed)} file(s) or directories in the bundle: {listed}"]
 
 
 def shell_command(runtime: Path) -> list[str]:
@@ -377,8 +748,38 @@ def fresh_install(url: str, data: Path, install: Install) -> list[str]:
             insert_as_postgres(connection),
             None,
         )
+    bundled_tools(install, report)
     work_the_stack(data, install, owner, report)
     return report.failures
+
+
+def bundled_tools(install: Install, report: Report) -> None:
+    """ffmpeg, as a backend service finds it: by name, the way the backend's
+    own subprocess calls and yt-dlp look for it, and through imageio-ffmpeg."""
+    assert install.runtime
+    host = next(iter(hosts(install).values()))
+    env = host.environ()
+    bundle = Path(host.exe()).resolve().parents[1 if sys.platform == "win32" else 2]
+    found = shutil.which("ffmpeg", path=env.get("PATH"))
+    inside = bool(found) and Path(found or "").resolve().is_relative_to(bundle / "tools" / "bin")
+    report.expect("a service finds `ffmpeg` on its PATH, in the bundle", inside, True, shown=found)
+    if not found:
+        return
+    banner = subprocess.run(
+        [found, "-version"], env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL
+    )
+    first = (banner.stdout.splitlines() or [banner.stderr.strip()])[0]
+    report.expect("...and it runs", first.startswith("ffmpeg version"), True, shown=first[:70])
+    asked = subprocess.run(
+        [host.exe(), "-B", "-c", "import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())"],
+        env=env,
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+    )
+    same = asked.returncode == 0 and os.path.samefile(asked.stdout.strip(), found)
+    shown = asked.stdout.strip() or asked.stderr.strip()[-300:]
+    report.expect("imageio-ffmpeg uses the same one", same, True, shown=shown)
 
 
 def work_the_stack(data: Path, install: Install, owner: Browser, report: Report) -> None:
@@ -404,7 +805,7 @@ def work_the_stack(data: Path, install: Install, owner: Browser, report: Report)
     catalog_log = data / "logs" / "skills-catalog.log"
     if time.monotonic() - install.ready_at < CATALOG_NOT_BEFORE_SECONDS:
         report.expect("the skills catalog publish has not started yet", catalog_log.exists(), False)
-    used = memory_table(install.runtime)
+    used = memory_table(install.runtime, nobodys_children(data, install.runtime))
     budget = MEMORY_BUDGET_MB.get(str(install.profile), 0)
     report.expect(f"memory within the {install.profile} budget of {budget} MB", used <= budget, True, shown=f"{used:.0f} MB")
     open_files(install, report)
@@ -615,7 +1016,26 @@ def settled_runs(data: Path, install: Install, report: Report, owner: Browser) -
     report.expect("a lock from before the restart", valkey(data, ports).exists(STALE_LOCK), 0)
 
 
-def memory_table(runtime: psutil.Process) -> float:
+def nobodys_children(data: Path, runtime: psutil.Process) -> list[psutil.Process]:
+    """Part of the stack, but not below the runtime in the process tree:
+    PostgreSQL on Windows, which pg_ctl starts and then leaves
+    (autogpt_desktop/postgres.py). Found the way the runtime finds it."""
+    try:
+        pid = int((data / "postgres" / "postmaster.pid").read_text().splitlines()[0])
+        server = psutil.Process(pid)
+        # A file left by an earlier start names a process that is gone, or
+        # by now somebody else's.
+        ours = born_under(server, runtime) and server.name().lower().startswith("postgres")
+        return [server] if ours and runtime not in server.parents() else []
+    except (OSError, ValueError, IndexError, psutil.Error):
+        return []
+
+
+def born_under(process: psutil.Process, runtime: psutil.Process) -> bool:
+    return process.create_time() >= runtime.create_time()
+
+
+def memory_table(runtime: psutil.Process, detached: list[psutil.Process]) -> float:
     """Print what each supervised process and its children hold; return the
     total in MB, without the skills-catalog publisher (a one-shot that is not
     part of the idle app). USS is memory unique to a process, the honest number on
@@ -625,7 +1045,7 @@ def memory_table(runtime: psutil.Process) -> float:
     footprints = macos_footprints()
     megabyte = 1024 * 1024
     rows: dict[str, list[float]] = {}
-    for child in [runtime, *runtime.children()]:
+    for child in [runtime, *runtime.children(), *detached]:
         members = [child] if child == runtime else [child, *child.children(recursive=True)]
         row = rows.setdefault(label(child, runtime), [0, 0, 0, 0])
         for member in members:
@@ -920,7 +1340,35 @@ def probe(url: str) -> list[str]:
         print(f"  {path} -> {status}")
         if status != expected:
             failures.append(f"{path} returned {status}, expected {expected}")
-    return failures
+    return failures + caches_put_to_work(url)
+
+
+def caches_put_to_work(url: str) -> list[str]:
+    """What the Next server would keep on disk beside its own code, asked
+    for: an optimised image (twice: the second answer comes from the cache,
+    wherever that is) and a page that fetches from the backend while it
+    renders. The check that the bundle is unchanged is what these are for."""
+    report = Report()
+    for attempt in ("first", "second"):
+        status, kind, _ = fetch(url + OPTIMISED_IMAGE, {"Accept": "image/webp"})
+        # Anything but an image Next encoded itself would not have been cached.
+        report.expect(f"an optimised image, {attempt} request", (status, kind), (200, "image/webp"))
+    status, _, body = fetch(url + "/sitemap.xml", {})
+    listed = b"/marketplace" in body
+    report.expect("the sitemap, which fetches while rendering", (status, listed), (200, True))
+    return report.failures
+
+
+def fetch(url: str, headers: dict[str, str]) -> tuple[int | str, str, bytes]:
+    """(status, content type, body); the status is the error's text when
+    there was no answer."""
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=60) as response:
+            return response.status, response.headers.get_content_type(), response.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.headers.get_content_type(), exc.read()
+    except (urllib.error.URLError, OSError) as exc:
+        return str(exc), "", b""
 
 
 def fetch_status(url: str) -> int | str:
@@ -931,21 +1379,6 @@ def fetch_status(url: str) -> int | str:
         return exc.code
     except (urllib.error.URLError, OSError) as exc:
         return str(exc)
-
-
-def processes_from(runtime: Path) -> list[psutil.Process]:
-    """Running processes whose executable lives in the bundle."""
-    root = os.path.normcase(os.path.realpath(runtime))
-    found = []
-    for process in psutil.process_iter(["pid", "name", "exe"]):
-        if process.info["pid"] == os.getpid():
-            continue
-        executable = process.info["exe"]
-        if not executable:
-            continue
-        if os.path.normcase(os.path.realpath(executable)).startswith(root + os.sep):
-            found.append(process)
-    return found
 
 
 def print_logs(data: Path) -> None:

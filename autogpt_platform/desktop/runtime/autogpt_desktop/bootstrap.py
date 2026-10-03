@@ -16,10 +16,10 @@ from __future__ import annotations
 
 import codecs
 import logging
-import os
 from contextlib import closing
 from pathlib import Path
 
+from autogpt_desktop import migrations
 from autogpt_desktop.layout import Bundle
 from autogpt_desktop.process import run_tool
 from autogpt_desktop.settings import FRONTEND_DB_ROLE
@@ -93,6 +93,7 @@ def refuse_interrupted_migration(connect) -> None:
 
 
 def apply_migrations(bundle: Bundle, env: dict[str, str]) -> None:
+    migrations.require_engines(bundle)
     command = [
         *bundle.node_command(),
         str(bundle.prisma_cli),
@@ -104,13 +105,8 @@ def apply_migrations(bundle: Bundle, env: dict[str, str]) -> None:
     result = run_tool(
         command,
         cwd=bundle.backend_dir,
-        env={
-            **os.environ,
-            **env,
-            "ELECTRON_RUN_AS_NODE": "1",
-            "CHECKPOINT_DISABLE": "1",
-            "PRISMA_HIDE_UPDATE_MESSAGE": "1",
-        },
+        # Offline, with the bundle's own engines: see migrations.py.
+        env=migrations.environment(bundle, env),
         capture_output=True,
         timeout=MIGRATION_TIMEOUT_SECONDS,
     )

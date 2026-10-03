@@ -287,6 +287,8 @@ def cache_home(tmp_path: Path, monkeypatch) -> None:
     """Keep the space-free aliases out of the real cache directory."""
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "home" / ".cache"))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "home" / "local"))
+    monkeypatch.setenv("PROGRAMDATA", str(tmp_path / "home" / "shared"))
 
 
 @pytest.mark.usefixtures("cache_home")
@@ -294,6 +296,7 @@ def test_rabbitmq_is_given_a_path_without_spaces(tmp_path: Path):
     """Its launch scripts break on a space, and macOS keeps application data
     under "Application Support"."""
     spaced = tmp_path / "Application Support" / "AutoGPT" / "rabbitmq"
+    spaced.mkdir(parents=True)  # as DataDir.prepare leaves it
     alias = Path(rabbitmq._short(spaced))
     (spaced / "marker").write_text("x")
 
@@ -306,6 +309,7 @@ def test_rabbitmq_is_given_a_path_without_spaces(tmp_path: Path):
 @pytest.mark.usefixtures("cache_home")
 def test_rabbitmq_scripts_are_run_through_the_alias(tmp_path: Path):
     bundle = Bundle(tmp_path / "My Apps" / "runtime")
+    bundle.rabbitmq_home.mkdir(parents=True)  # an alias is to a directory that exists
     script = Path(rabbitmq._script(bundle, "rabbitmq-server"))
     assert script.parent.name == "sbin"
     if not any(character.isspace() for character in str(tmp_path)):

@@ -14,6 +14,7 @@ each Linux path replaced by a directory under the runtime root:
       erlang/, rabbitmq/    RabbitMQ and the Erlang runtime it needs
       erlang-patches/       inet_udp built to bind loopback (build/erlang_patches.py)
       prisma/               Prisma CLI and engines
+      tools/bin/            programs the backend runs by name (ffmpeg)
       assets/               00-init.sql
 """
 
@@ -82,6 +83,14 @@ class Bundle:
         return self.root / "prisma" / f"{name}{EXE}"
 
     @property
+    def tools_bin(self) -> Path:
+        return self.root / "tools" / "bin"
+
+    @property
+    def ffmpeg(self) -> Path:
+        return self.tools_bin / f"ffmpeg{EXE}"
+
+    @property
     def init_sql(self) -> Path:
         return self.root / "assets" / "00-init.sql"
 
@@ -117,10 +126,6 @@ class DataDir:
     @property
     def ports_file(self) -> Path:
         return self.config / "ports.json"
-
-    @property
-    def backend_config(self) -> Path:
-        return self.config / "backend.json"
 
     @property
     def postgres(self) -> Path:

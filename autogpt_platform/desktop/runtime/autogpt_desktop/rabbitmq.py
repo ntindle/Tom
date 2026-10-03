@@ -18,7 +18,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from autogpt_desktop import install
+from autogpt_desktop import install, winlinks
 from autogpt_desktop.layout import EXE, SCRIPT, Bundle, DataDir, write_private
 from autogpt_desktop.process import ManagedProcess, base_env, run_tool
 
@@ -71,6 +71,9 @@ def prepare(data: DataDir, port: int, user: str, password: str) -> None:
 
 
 def environment(bundle: Bundle, data: DataDir, ports: dict[str, int]) -> dict[str, str]:
+    # Created here if need be, unlike the bundle's directories: nothing is
+    # ever created inside the bundle.
+    data.rabbitmq.mkdir(parents=True, exist_ok=True)
     base = _short(data.rabbitmq)
     erlang = _short(bundle.erlang_home)
     env = {
@@ -86,6 +89,9 @@ def environment(bundle: Bundle, data: DataDir, ports: dict[str, int]) -> dict[st
         "RABBITMQ_CONFIG_FILE": str(Path(base) / "rabbitmq.conf"),
         "RABBITMQ_ENABLED_PLUGINS_FILE": str(Path(base) / "enabled_plugins"),
         "RABBITMQ_LOGS": "-",
+        # Logging goes to the console. Should a file log ever be switched
+        # on, its default place is under RABBITMQ_HOME: inside the bundle.
+        "RABBITMQ_LOG_BASE": str(Path(base) / "log"),
         "RABBITMQ_NODENAME": NODE_NAME,
         "RABBITMQ_DIST_PORT": str(ports["rabbitmq_dist"]),
         "ERL_EPMD_PORT": str(ports["epmd"]),
@@ -203,9 +209,8 @@ def _short(path: Path) -> str:
     normally contain a space or the user's name: `%LOCALAPPDATA%` on Windows,
     `~/Library/Application Support` on macOS.
     """
-    path.mkdir(parents=True, exist_ok=True)
     if sys.platform == "win32":
-        return _windows_short_name(path)
+        return _windows_alias(path)
     if not any(character.isspace() for character in str(path)):
         return str(path)
     link = _alias_root() / hashlib.sha256(str(path).encode()).hexdigest()[:16]
@@ -221,34 +226,57 @@ def _alias_root() -> Path:
     the temp directory, which macOS and systemd clear of anything untouched
     for a few days; the broker would lose its data path while running."""
     assert sys.platform != "win32"
+    root = _cache_alias_root()
+    if any(character.isspace() for character in str(root)):
+        root = _temp_alias_root()
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return root
+
+
+def _cache_alias_root() -> Path:
     if sys.platform == "darwin":
         cache = Path.home() / "Library" / "Caches"
     else:
         cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
     # A folder of its own for each install: a variant of the app shares
     # none with the normal app.
-    name = install.name()
-    root = cache / name / "links"
-    if any(character.isspace() for character in str(root)):
-        root = Path(tempfile.gettempdir()) / f"{name.lower()}-desktop-{os.getuid()}"
-    root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    return root
+    return cache / install.name() / "links"
 
 
-def _windows_short_name(path: Path) -> str:
-    """The 8.3 alias of the directory, which has neither spaces nor
-    non-ASCII characters."""
-    import ctypes
+def _temp_alias_root() -> Path:
+    """Stands in for the cache folder when that one's own path has a space."""
+    assert sys.platform != "win32"
+    return Path(tempfile.gettempdir()) / f"{install.name().lower()}-desktop-{os.getuid()}"
 
-    buffer = ctypes.create_unicode_buffer(32768)
-    length = ctypes.windll.kernel32.GetShortPathNameW(str(path), buffer, len(buffer))
-    short = buffer.value if 0 < length < len(buffer) else str(path)
-    if any(character.isspace() for character in short):
-        # Short names can be switched off per drive, and usually are on
-        # drives other than the system one.
-        raise RuntimeError(
-            f"AutoGPT cannot run from a folder with a space in its name ({path}) "
-            "on a drive that has short file names turned off. Install it on the "
-            "system drive, or in a folder without spaces."
-        )
-    return short
+
+def alias_roots() -> list[Path]:
+    """Every folder this install's aliases may be in, whether it exists or
+    not. Nothing is created: this is for clearing up (build/smoke_test.py)."""
+    if sys.platform != "win32":
+        return [_cache_alias_root(), _temp_alias_root()]
+    try:
+        user = winlinks.current_user_sid()
+    except OSError:
+        return []
+    found = winlinks.roots(install.name(), os.environ, user, winlinks.short_name)
+    return [root.path for root in found]
+
+
+def _windows_alias(path: Path) -> str:
+    """The directory's 8.3 name, which has neither spaces nor non-ASCII
+    characters; where the volume keeps no short names, a junction to it
+    from a place whose path is plain (winlinks.py)."""
+    short = winlinks.short_name(str(path))
+    if winlinks.plain(short):
+        return short
+    alias = winlinks.alias(path, install.name())
+    if alias:
+        return alias
+    if not any(character.isspace() for character in short):
+        return short  # not plain, but nothing the scripts are known to break on
+    raise RuntimeError(
+        f"AutoGPT cannot run from a folder with a space in its name ({path}) "
+        "on a drive that has short file names turned off, and it could not make "
+        "a link to that folder from a place without one (see the log). Install "
+        "it, and keep its data, in folders without spaces."
+    )

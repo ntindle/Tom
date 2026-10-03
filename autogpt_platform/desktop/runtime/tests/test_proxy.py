@@ -8,7 +8,12 @@ import aiohttp
 import pytest
 from aiohttp import web
 
-from autogpt_desktop.proxy import ProxyThread, Upstreams
+from autogpt_desktop.proxy import (
+    ProxyThread,
+    Upstreams,
+    _report_loop_error,
+    client_went_away,
+)
 
 
 RELEASE: web.AppKey[asyncio.Event] = web.AppKey("release")
@@ -210,3 +215,88 @@ async def test_a_down_upstream_is_a_bad_gateway_not_a_crash(stack):
             assert response.status == 502
     finally:
         await asyncio.to_thread(proxy_with_dead_upstream.stop)
+
+
+# --- what the proxy's event loop reports ---------------------------------------
+
+
+class _ProactorBasePipeTransport:
+    """Named and shaped like asyncio's, whose callback is what fails on
+    Windows when a browser drops a connection."""
+
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+
+    def _call_connection_lost(self, exc) -> None:
+        raise self.error
+
+    def _loop_reading(self, future) -> None:
+        raise self.error
+
+
+def reported_by_a_loop(callback, *arguments) -> dict:
+    """What asyncio itself hands an exception handler when `callback` fails."""
+    loop = asyncio.new_event_loop()
+    seen: list[dict] = []
+    loop.set_exception_handler(lambda loop, context: seen.append(context))
+    try:
+        loop.call_soon(callback, *arguments)
+        loop.call_soon(loop.stop)
+        loop.run_forever()
+    finally:
+        loop.close()
+    (context,) = seen
+    return context
+
+
+class RecordingLoop(asyncio.BaseEventLoop):
+    def __init__(self) -> None:
+        super().__init__()
+        self.passed_on: list[dict] = []
+
+    def default_exception_handler(self, context: dict) -> None:
+        self.passed_on.append(context)
+
+
+@pytest.mark.parametrize("error", [ConnectionResetError(10054, "reset"), ConnectionAbortedError()])
+def test_a_connection_dropped_by_its_other_end_is_logged_quietly(error, caplog):
+    transport = _ProactorBasePipeTransport(error)
+    context = reported_by_a_loop(transport._call_connection_lost, None)
+    # As in a runtime.log from Windows: "Exception in callback
+    # _ProactorBasePipeTransport._call_connection_lost()".
+    assert "_ProactorBasePipeTransport._call_connection_lost" in context["message"]
+    assert client_went_away(context)
+
+    loop = RecordingLoop()
+    with caplog.at_level("DEBUG", logger="autogpt_desktop"):
+        _report_loop_error(loop, context)
+    loop.close()
+
+    assert loop.passed_on == []
+    (record,) = [r for r in caplog.records if "dropped by its other end" in r.getMessage()]
+    assert record.levelname == "DEBUG" and not record.exc_info
+
+
+@pytest.mark.parametrize(
+    ("error", "callback"),
+    [
+        (RuntimeError("a bug"), "_call_connection_lost"),  # another error, same place
+        (ConnectionResetError(10054, "reset"), "_loop_reading"),  # same error, elsewhere
+        (OSError("disk"), "_loop_reading"),
+    ],
+)
+def test_anything_else_the_loop_reports_still_reaches_the_default_handler(error, callback):
+    transport = _ProactorBasePipeTransport(error)
+    context = reported_by_a_loop(getattr(transport, callback), None)
+    assert not client_went_away(context)
+
+    loop = RecordingLoop()
+    _report_loop_error(loop, context)
+    loop.close()
+
+    assert loop.passed_on == [context]
+
+
+def test_a_report_without_an_exception_is_not_mistaken_for_one():
+    assert not client_went_away({"message": "Task was destroyed but it is pending!"})
+    assert not client_went_away({})
