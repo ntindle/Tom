@@ -4,6 +4,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { app, BrowserWindow, Menu, Tray, dialog, ipcMain, nativeImage, shell } = require("electron");
 
+const { classifyMainNavigation, classifyWindowOpen } = require("./navigation");
 const { defaultDataDir, readRuntimeManifest, runtimeDir } = require("./paths");
 const { Runtime } = require("./runtime");
 
@@ -18,18 +19,20 @@ let mainWindow = null;
 let tray = null;
 let appUrl = null;
 let quitting = false;
+let failure = null;
 const history = [];
 
 if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
   app.on("second-instance", () => focusWindow());
+  app.on("web-contents-created", (_, contents) => routeNewWindows(contents));
   app.whenReady().then(boot);
 }
 
 function boot() {
   fs.mkdirSync(logsDir, { recursive: true });
-  Menu.setApplicationMenu(null);
+  Menu.setApplicationMenu(applicationMenu());
   createTray();
   showStartupWindow();
   startRuntime();
@@ -59,13 +62,11 @@ function startRuntime() {
   });
   runtime.on("event", onRuntimeEvent);
   runtime.on("exit", ({ code, expected }) => {
-    if (!expected && !quitting) {
-      report({
-        event: "error",
-        fatal: true,
-        message: `AutoGPT stopped unexpectedly (exit code ${code}).`,
-      });
-    }
+    if (expected || quitting) return;
+    // A runtime that failed has usually said why already; keep its words.
+    const message = failure || `AutoGPT stopped unexpectedly (exit code ${code}).`;
+    if (!failure) report({ event: "error", fatal: true, message });
+    if (mainWindow) explainCrash(message);
   });
   runtime.start();
 }
@@ -79,6 +80,7 @@ function onRuntimeEvent(event) {
 }
 
 function report(event) {
+  if (event.event === "error" && event.fatal) failure = event.message;
   history.push(event);
   startupWindow?.webContents.send("runtime-event", event);
   if (event.event === "error" && event.fatal) focusWindow();
@@ -121,7 +123,7 @@ function openMainWindow() {
     show: false,
     webPreferences: { contextIsolation: true, sandbox: true },
   });
-  keepNavigationInApp(mainWindow);
+  keepMainWindowInApp(mainWindow);
   mainWindow.loadURL(appUrl);
   mainWindow.once("ready-to-show", () => {
     mainWindow.show();
@@ -133,20 +135,55 @@ function openMainWindow() {
   });
 }
 
-// The app's own origin stays in the window; everything else (docs, OAuth
-// consent screens, marketplace links) belongs in the user's browser.
-function keepNavigationInApp(window) {
-  const isAppUrl = (url) => appUrl && new URL(url).origin === new URL(appUrl).origin;
-  window.webContents.setWindowOpenHandler(({ url }) => {
-    if (!isAppUrl(url)) shell.openExternal(url);
-    return { action: isAppUrl(url) ? "allow" : "deny" };
+// See navigation.js for what stays in the app and why.
+function routeNewWindows(contents) {
+  contents.setWindowOpenHandler((details) => {
+    const destination = classifyWindowOpen(details, appUrl);
+    if (destination === "browser") shell.openExternal(details.url);
+    if (destination !== "app") return { action: "deny" };
+    return {
+      action: "allow",
+      overrideBrowserWindowOptions: {
+        icon: ICON,
+        autoHideMenuBar: true,
+        webPreferences: { contextIsolation: true, sandbox: true },
+      },
+    };
   });
+}
+
+function keepMainWindowInApp(window) {
   window.webContents.on("will-navigate", (event, url) => {
-    if (!isAppUrl(url)) {
-      event.preventDefault();
-      shell.openExternal(url);
-    }
+    const destination = classifyMainNavigation(url, appUrl);
+    if (destination === "app") return;
+    event.preventDefault();
+    if (destination === "browser") shell.openExternal(url);
   });
+}
+
+// The backend is gone, so the page in the window can only fail from here on.
+async function explainCrash(message) {
+  const { response } = await dialog.showMessageBox(mainWindow, {
+    type: "error",
+    message,
+    detail: "The logs usually say why. AutoGPT will close.",
+    buttons: ["Show logs", "Close"],
+    defaultId: 1,
+  });
+  if (response === 0) shell.openPath(logsDir);
+  app.quit();
+}
+
+// macOS routes Cmd+C/V/A/Q through the application menu, so removing the
+// menu there removes the shortcuts. Elsewhere the menu bar is just clutter.
+function applicationMenu() {
+  if (process.platform !== "darwin") return null;
+  return Menu.buildFromTemplate([
+    { role: "appMenu" },
+    { role: "editMenu" },
+    { role: "viewMenu" },
+    { role: "windowMenu" },
+  ]);
 }
 
 function focusWindow() {
