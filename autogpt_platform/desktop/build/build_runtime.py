@@ -105,10 +105,10 @@ class Build:
             shutil.rmtree(target)
         target.mkdir(parents=True)
         source = PLATFORM / "backend"
+        # The whole package, tests included: some runtime modules are named
+        # like tests (backend/blocks/exa/_test.py) and are imported at start.
         shutil.copytree(
-            source / "backend",
-            target / "backend",
-            ignore=shutil.ignore_patterns("__pycache__", "*_test.py", "snapshots"),
+            source / "backend", target / "backend", ignore=shutil.ignore_patterns("__pycache__")
         )
         shutil.copytree(source / "migrations", target / "migrations")
         shutil.copy2(source / "schema.prisma", target / "schema.prisma")
