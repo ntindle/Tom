@@ -313,12 +313,21 @@ class Build:
         for cache in (self.out / "python").rglob("__pycache__"):
             shutil.rmtree(cache, ignore_errors=True)
         shutil.rmtree(self.out / "python" / "include", ignore_errors=True)
-        over_budget = [
-            str(path.relative_to(self.out))
-            for path in self.out.rglob("*")
-            if path.is_file()
-            and len(str(path.relative_to(self.out))) - RELOCATION_SAVING > MAX_RELATIVE_PATH
-        ]
+        if WINDOWS:
+            self._check_path_budget()
+
+    def _check_path_budget(self) -> None:
+        """Fail the build rather than ship a file Windows cannot install."""
+        packages = self.site_packages.relative_to(self.out)
+        saving = len(str(packages)) - len("site")  # what step_relocate removes
+        over_budget = []
+        for path in self.out.rglob("*"):
+            relative = path.relative_to(self.out)
+            length = len(str(relative))
+            if packages in relative.parents:
+                length -= saving
+            if path.is_file() and length > MAX_RELATIVE_PATH:
+                over_budget.append(str(relative))
         if over_budget:
             raise RuntimeError(f"paths too long for a Windows install: {over_budget[:5]}")
 
@@ -378,8 +387,6 @@ class Build:
 # (C:\Users\<20-character name>\AppData\Local\Programs\AutoGPT\resources\runtime\),
 # which leaves this much of the 260-character limit for paths inside the bundle.
 MAX_RELATIVE_PATH = 170
-# What step_relocate takes off a site-packages path (prune runs before it).
-RELOCATION_SAVING = len("python/Lib/site-packages") - len("site")
 
 # OTP applications RabbitMQ 4.1 and its Elixir-based CLI load.
 ERLANG_APPS = {
