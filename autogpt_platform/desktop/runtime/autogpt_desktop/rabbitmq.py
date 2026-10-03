@@ -21,6 +21,12 @@ from autogpt_desktop.process import ManagedProcess, run_tool, wait_until
 NODE_NAME = "rabbit@localhost"
 INETRC_NAME = "erl_inetrc"
 LOOPBACK_DISTRIBUTION = "-kernel inet_dist_use_interface {127,0,0,1}"
+# RabbitMQ starts its syslog client while it boots, before it knows logging
+# goes to the console. In its default UDP mode the client opens a socket on
+# every interface at once (it takes no bind address), which is enough for
+# Windows Firewall to prompt. In TCP mode it connects only when it has a
+# message to send, and with console logging it never does.
+QUIET_SYSLOG = "-syslog protocol {rfc5424,tcp}"
 WINDOWS = sys.platform == "win32"
 
 
@@ -80,10 +86,12 @@ def environment(bundle: Bundle, data: DataDir, ports: dict[str, int]) -> dict[st
         "ERL_INETRC": str(Path(base) / INETRC_NAME),
         # Erlang distribution listens on every interface unless told
         # otherwise, and it starts listening before rabbitmq.conf is read.
-        # rabbitmqctl is an Erlang node too. A non-loopback listener is
-        # needless exposure, and on Windows it raises a firewall prompt.
-        "RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS": LOOPBACK_DISTRIBUTION,
-        "RABBITMQ_CTL_ERL_ARGS": LOOPBACK_DISTRIBUTION,
+        # ERL_AFLAGS reaches every VM started under this environment: the
+        # server, rabbitmqctl, and the short-lived `epmd-starter` node that
+        # rabbitmq-server.bat launches. A non-loopback listener from any of
+        # them is needless exposure, and on Windows raises a firewall prompt.
+        "ERL_AFLAGS": LOOPBACK_DISTRIBUTION,
+        "RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS": QUIET_SYSLOG,
         "ERL_CRASH_DUMP": str(Path(base) / "erl_crash.dump"),
         # Erlang finds its cookie in the home directory; point every flavour
         # of "home" at the data dir so the server and rabbitmqctl agree.

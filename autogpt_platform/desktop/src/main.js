@@ -10,6 +10,7 @@ const { Runtime } = require("./runtime");
 const ICON = path.join(__dirname, "icon.png");
 const dataDir = defaultDataDir();
 const logsDir = path.join(dataDir, "logs");
+const settingsFile = path.join(dataDir, "config", "settings.env");
 
 let runtime = null;
 let startupWindow = null;
@@ -162,6 +163,7 @@ function createTray() {
     Menu.buildFromTemplate([
       { label: "Open AutoGPT", click: focusWindow },
       { label: "Open in browser", click: () => appUrl && shell.openExternal(appUrl) },
+      { label: "Settings file (API keys)", click: () => shell.openPath(settingsFile) },
       { label: "Show logs", click: () => shell.openPath(logsDir) },
       { type: "separator" },
       { label: "Quit AutoGPT", click: () => app.quit() },

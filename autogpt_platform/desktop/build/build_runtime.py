@@ -237,11 +237,18 @@ class Build:
             return ["pnpm"]
         # No pnpm installed: the pinned Node distribution that step_node
         # unpacked carries corepack, which fetches the pnpm version the
-        # frontend's package.json names.
+        # frontend's package.json names. The shims go in a directory on PATH
+        # because the frontend's own scripts call `pnpm` again.
         node_bin = self.cache / "node-dist" / "bin"
-        env["PATH"] = os.pathsep.join([str(node_bin), env["PATH"]])
+        shims = self.cache / "corepack-bin"
+        shims.mkdir(parents=True, exist_ok=True)
+        env["PATH"] = os.pathsep.join([str(shims), str(node_bin), env["PATH"]])
         env["COREPACK_ENABLE_DOWNLOAD_PROMPT"] = "0"
-        return [str(node_bin / "corepack"), "pnpm"]
+        run(
+            [str(node_bin / "corepack"), "enable", "--install-directory", str(shims), "pnpm"],
+            env=env,
+        )
+        return [str(shims / "pnpm")]
 
     # --- glue -------------------------------------------------------------
 
@@ -425,7 +432,7 @@ def _add_msvc_runtime(erlang: Path) -> None:
     an installer for it instead of the DLLs. Put the DLLs beside the
     binaries so a machine without the redistributable can still run them."""
     system32 = Path(os.environ["SYSTEMROOT"]) / "System32"
-    for bin_dir in erlang.glob("erts-*/bin"):
+    for bin_dir in (erlang / "bin", *erlang.glob("erts-*/bin")):
         for name in ("vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll"):
             shutil.copy2(system32 / name, bin_dir / name)
 
