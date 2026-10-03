@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import shutil
-import sys
 import tarfile
 import urllib.request
 import zipfile
@@ -26,9 +25,7 @@ def download(artifact: Artifact, cache: Path, name: str | None = None) -> Path:
             shutil.copyfileobj(response, out, length=1024 * 1024)
         partial.replace(target)
     digest = _sha256(target)
-    if artifact.sha256 is None:
-        print(f"  UNPINNED {artifact.filename} sha256={digest}", file=sys.stderr)
-    elif digest != artifact.sha256:
+    if digest != artifact.sha256:
         target.unlink()
         raise RuntimeError(
             f"{artifact.filename}: sha256 {digest} does not match the pinned {artifact.sha256}"

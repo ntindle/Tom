@@ -55,9 +55,10 @@ FRONTEND_BUILD_ENV = {
 
 
 class Build:
-    def __init__(self, out: Path, cache: Path) -> None:
+    def __init__(self, out: Path, cache: Path, redis_stand_in: bool = False) -> None:
         self.out = out
         self.cache = cache
+        self.redis_stand_in = redis_stand_in
         self.artifacts = ARTIFACTS[platform_key()]
         self.python = out / "python" / ("python.exe" if WINDOWS else "bin/python3")
         self.site_packages = out / "python" / (
@@ -231,17 +232,17 @@ class Build:
         if WINDOWS and (prebuilt / "valkey-server.exe").is_file():
             shutil.copytree(prebuilt, target)
             return
+        if WINDOWS and not self.redis_stand_in:
+            raise RuntimeError(
+                f"No Valkey build in {prebuilt}. Run build/valkey-windows.sh under "
+                "MSYS2 first. For a local build only, --redis-stand-in bundles the "
+                "redis-windows build of Redis instead; do not publish that one."
+            )
         source = self.fetch("valkey")
         staging = self.cache / "valkey-dist"
         extract(source, staging, strip_top_level=True)
         target.mkdir(parents=True)
         if WINDOWS:
-            print(
-                "  WARNING: no Valkey build in .cache/valkey-windows; bundling the "
-                "redis-windows build of Redis instead (AGPL/RSAL/SSPL, not BSD). "
-                "Run build/valkey-windows.sh before publishing.",
-                file=sys.stderr,
-            )
             shutil.copy2(staging / "redis-server.exe", target / "valkey-server.exe")
             for library in staging.glob("*.dll"):
                 shutil.copy2(library, target / library.name)
@@ -534,6 +535,11 @@ def main() -> int:
     parser.add_argument("--cache", type=Path, default=DESKTOP / "build" / ".cache")
     parser.add_argument("--only", default="")
     parser.add_argument("--skip", default="")
+    parser.add_argument(
+        "--redis-stand-in",
+        action="store_true",
+        help="Windows, local builds only: bundle Redis when no Valkey build is in the cache",
+    )
     args = parser.parse_args()
     only = [name for name in args.only.split(",") if name]
     skip = {name for name in args.skip.split(",") if name}
@@ -541,7 +547,7 @@ def main() -> int:
     if unknown:
         parser.error(f"unknown steps: {sorted(unknown)}")
 
-    build = Build(args.out.resolve(), args.cache.resolve())
+    build = Build(args.out.resolve(), args.cache.resolve(), args.redis_stand_in)
     build.out.mkdir(parents=True, exist_ok=True)
     for name in only or STEPS:
         if name in skip:
