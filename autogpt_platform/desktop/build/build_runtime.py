@@ -163,14 +163,25 @@ class Build:
         shutil.rmtree(self.out / "postgres" / "include", ignore_errors=True)
 
     def step_valkey(self) -> None:
-        source = self.fetch("valkey")
         target = self.out / "valkey"
-        staging = self.cache / "valkey-dist"
-        extract(source, staging, strip_top_level=True)
         if target.exists():
             shutil.rmtree(target)
+        # Windows: valkey-windows.sh (run under MSYS2) leaves its output here.
+        prebuilt = self.cache / "valkey-windows"
+        if WINDOWS and (prebuilt / "valkey-server.exe").is_file():
+            shutil.copytree(prebuilt, target)
+            return
+        source = self.fetch("valkey")
+        staging = self.cache / "valkey-dist"
+        extract(source, staging, strip_top_level=True)
         target.mkdir(parents=True)
         if WINDOWS:
+            print(
+                "  WARNING: no Valkey build in .cache/valkey-windows; bundling the "
+                "redis-windows build of Redis instead (AGPL/RSAL/SSPL, not BSD). "
+                "Run build/valkey-windows.sh before publishing.",
+                file=sys.stderr,
+            )
             shutil.copy2(staging / "redis-server.exe", target / "valkey-server.exe")
             for library in staging.glob("*.dll"):
                 shutil.copy2(library, target / library.name)
